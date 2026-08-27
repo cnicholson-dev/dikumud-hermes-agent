@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# Collect one session into a directory: what the game said, what the agent did,
+# how it ended, and what it cost.
+#
+# Nothing here is new evidence. The audit record on its own volume is the
+# evidence, and it is untouched by this. A capture is a readable copy of one
+# session assembled from sources that already exist, so that a session leaves
+# something behind other than state:
+#
+#   session_id     the session this capture belongs to
+#   play.log       the game's own output for this session
+#   transcript.txt one line per command and refusal, from the audit record
+#   frame.txt      the final spectator frame: state, learning, cost, stop reason
+#   client.log     hermes chat's own output, kept because a session that fails
+#                  to start says why there and nowhere else
+#   reasoning.log  what the model was thinking, as the relay streamed it. It
+#                  lives on a tmpfs in that container, so this capture is the
+#                  only thing that outlives the session
+#   session.cast   the asciicast, when the run was watched (written by the
+#   session.gif    caller, converted with agg)
+#
+#   scripts/capture-session [--dir DIR] [--offset BYTES] [--if-new]
+#
+#   --dir     write here rather than into sessions/<time>-<character>
+#   --offset  the byte offset in play.log where this session began. Without it
+#             the whole current file is taken and said so.
+#   --if-new  do nothing when this session has already been captured
+#
+# DISCLOSURE
+#   public-documentation/DEMO.md reviews a recording by hand before it is
+#   published. This does the same checks over everything it wrote, because a
+#   capture happens every session and a check that only runs before publication
+#   runs too late to change what is on disk.
+#
+#   A credential match anywhere renames the directory to <name>-REVIEW and
+#   exits non-zero. The directory is kept: deleting the evidence of a
+#   disclosure is the wrong response to finding one.
+#
+#   The reasoning scan is narrower than it was. The spectator has a reasoning
+#   panel now, so frame.txt and session.cast carry reasoning deliberately and
+#   are no longer scanned for it; play.log and transcript.txt still are,
+#   because the game and the audit record must never produce any.
+#
+#   A reasoning match in client.log is a warning rather than a failure, but it
+#   now means something specific: the relay's response strip may have failed,
+#   which would put the model's own thinking into its next turn's context.
+#
+#   session.gif is not scanned, because it is pixels. It is converted from
+#   session.cast, which is text and is scanned.
+#
+# Exit codes: 0 captured, 1 a disclosure check failed or a step failed, 2 usage.
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+PLAY=/var/log/mud-control/play.log
+DIR=""
+OFFSET=0
+IF_NEW=0
+
+usage() { echo "usage: scripts/capture-session [--dir DIR] [--offset BYTES] [--if-new]" >&2; exit 2; }
+fail()  { echo "capture-session: $*" >&2; exit 1; }
+say()   { printf '%-16s %s\n' "$1" "$2"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir)    shift; [ $# -gt 0 ] || usage; DIR="$1" ;;
+    --offset) shift; [ $# -gt 0 ] || usage; OFFSET="$1" ;;
+    --if-new) IF_NEW=1 ;;
+    -h|--help) usage ;;
+    *) echo "capture-session: unknown option: $1" >&2; usage ;;
+  esac
+  shift
+done
+
+case "$OFFSET" in
+  ''|*[!0-9]*) fail "--offset takes a whole number of bytes" ;;
+esac
+
+# shellcheck source=scripts/lib/session.sh
+. scripts/lib/session.sh
+
+running mud-control || { say "capture" "mud-control is not running; nothing to capture"; exit 0; }
+
+SESSION_ID="$(current_session_id)"
+CHARACTER="$(running_character)"
+[ -n "$CHARACTER" ] || CHARACTER=unknown
+
+if [ -z "$SESSION_ID" ]; then
+  say "capture" "no session in the audit record; nothing to capture"
+  exit 0
+fi
+
+# The id is what makes this answerable: two scripts can both try to capture the
+# same session, and only one of them should.
+if [ "$IF_NEW" = 1 ] && grep -rqx "$SESSION_ID" sessions/*/session_id 2>/dev/null; then
+  say "capture" "session $SESSION_ID is already captured"
+  exit 0
+fi
+
+[ -n "$DIR" ] || DIR="sessions/$(date -u +%Y-%m-%dT%H%M%SZ)-$CHARACTER"
+mkdir -p "$DIR"
+printf '%s\n' "$SESSION_ID" > "$DIR/session_id"
+
+# -- the game's own output -------------------------------------------------
+#
+# PlayLog writes one bounded, rotated file with no session markers in it, so
+# the slice is arithmetic. When the file is smaller than the offset it rotated
+# mid-session, and the session's earlier text is in the single generation
+# PlayLog keeps. Two rotations in one session lose the earliest part, which the
+# file says rather than leaving the reader to wonder.
+current_size="$(docker compose exec -T mud-control sh -c "wc -c < $PLAY 2>/dev/null" | tr -dc '0-9')"
+: "${current_size:=0}"
+
+{
+  if [ "$OFFSET" = 0 ]; then
+    echo "# whole play log at capture time; this session's start offset was not recorded"
+  elif [ "$current_size" -lt "$OFFSET" ]; then
+    echo "# the play log rotated during this session; earlier text may be missing"
+  fi
+} > "$DIR/play.log"
+
+if [ "$current_size" -lt "$OFFSET" ]; then
+  docker compose exec -T mud-control sh -c \
+    "tail -c +$((OFFSET + 1)) $PLAY.1 2>/dev/null; cat $PLAY 2>/dev/null" \
+    >> "$DIR/play.log" || true
+else
+  docker compose exec -T mud-control sh -c \
+    "tail -c +$((OFFSET + 1)) $PLAY 2>/dev/null" >> "$DIR/play.log" || true
+fi
+
+# -- what the agent did ----------------------------------------------------
+scripts/spectate --transcript > "$DIR/transcript.txt" || true
+scripts/spectate --once       > "$DIR/frame.txt"      || true
+
+# -- the client's own output -----------------------------------------------
+if docker compose exec -T hermes-player sh -c 'cat /tmp/hermes-chat.log' \
+     > "$DIR/client.log" 2>/dev/null; then
+  :
+else
+  echo "# no client log: the session was not started by scripts/2.start-agent" \
+    > "$DIR/client.log"
+fi
+
+# -- what the model was thinking -------------------------------------------
+# The relay's feed, which is what the spectator's reasoning panel reads. On a
+# tmpfs inside that container, so it exists only while the container does and
+# a capture is the only way it survives the session at all.
+if docker compose exec -T openrouter-relay sh -c 'cat /tmp/reasoning.log' \
+     > "$DIR/reasoning.log" 2>/dev/null; then
+  :
+else
+  echo "# no reasoning log: the relay was not running, or the feed is off" \
+    > "$DIR/reasoning.log"
+fi
+
+# -- disclosure ------------------------------------------------------------
+#
+# The password is read for comparison and never printed, never passed on a
+# command line, and never written anywhere.
+SECRETS_DIR="${SECRETS_DIR:-}"
+if [ -z "$SECRETS_DIR" ] && [ -f .env ]; then
+  set -a; . ./.env; set +a
+fi
+
+review() {
+  local moved="${DIR%/}-REVIEW"
+  mv "$DIR" "$moved"
+  echo >&2
+  echo "capture-session: $1" >&2
+  echo "capture-session: kept as $moved. Do not publish it. The capture is" >&2
+  echo "  retained deliberately: a disclosure is something to look at, not" >&2
+  echo "  something to delete." >&2
+  exit 1
+}
+
+if [ -n "${SECRETS_DIR:-}" ] && [ -r "$SECRETS_DIR/game-credential" ]; then
+  password="$(awk 'NR==2' "$SECRETS_DIR/game-credential")"
+  if [ -n "$password" ]; then
+    for f in "$DIR"/*; do
+      [ -f "$f" ] || continue
+      case "$f" in *.gif) continue ;; esac
+      if grep -Fq -- "$password" "$f" 2>/dev/null; then
+        review "the character's password appears in $(basename "$f")"
+      fi
+    done
+  fi
+  unset password
+else
+  say "disclosure" "SECRETS_DIR is unset or unreadable; the credential check did not run"
+fi
+
+# The reasoning scan applies to the surfaces that still must not carry any.
+# frame.txt and session.cast are no longer among them: the spectator has a
+# reasoning panel now, so both carry it by design and quarantining them would
+# fail every capture. play.log is the game's own words and transcript.txt comes
+# from the audit record, which refuses a reasoning field by name, so a match in
+# either still means something upstream produced content it should not have.
+for f in "$DIR"/play.log "$DIR"/transcript.txt; do
+  [ -f "$f" ] || continue
+  if grep -qiE 'reasoning|chain.of.thought' "$f" 2>/dev/null; then
+    review "reasoning content appears in $(basename "$f"), which comes from a surface that must not carry any"
+  fi
+done
+
+# client.log is what `hermes chat` printed, so it is what the agent received.
+# The relay still strips reasoning from every reply, and that strip is now the
+# only thing keeping the model's own thinking out of its next turn's context
+# rather than the second of two guards. A match here means it failed, which is
+# a stronger signal than it was when this was merely untidy.
+if [ -f "$DIR/client.log" ] &&
+   grep -qiE 'reasoning|chain.of.thought' "$DIR/client.log" 2>/dev/null; then
+  say "disclosure" "client.log mentions reasoning; the relay's response strip may have failed. Check services/openrouter-relay/src/openrouter_relay/upstream.py"
+fi
+
+# -- what was captured -----------------------------------------------------
+# `grep -c` prints its count and still exits non-zero when the count is zero,
+# so a `|| echo 0` here appended a second line and the summary read "Wren, 0
+# 0 commands". Its own output is already the number.
+commands="$(grep -c 'mud_act' "$DIR/transcript.txt" 2>/dev/null || true)"
+: "${commands:=0}"
+say "captured" "$DIR"
+say "" "$CHARACTER, $commands commands, session $SESSION_ID"

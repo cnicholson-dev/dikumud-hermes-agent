@@ -1,0 +1,18 @@
+diff -ruN ref/interpreter.c work/interpreter.c
+--- ref/interpreter.c	2026-08-20 10:47:19.013352977 -0400
++++ work/interpreter.c	2026-08-20 10:47:25.441154214 -0400
+@@ -1019,7 +1019,13 @@
+ 	void do_look(struct char_data *ch, char *argument, int cmd);
+ 	void load_char_objs(struct char_data *ch);
+ 	int load_char(char *name, struct char_file_u *char_element);
+-	struct crypt_data crypted;
++	/*
++	*  Must be zero-initialized. crypt_r() from libxcrypt requires a cleared
++	*  struct crypt_data on first use; left as uninitialized stack memory it
++	*  can return a wrong hash, which makes login fail for a correct password.
++	*  See patches/README.md 0005.
++	*/
++	struct crypt_data crypted = {0};
+ 
+ 	switch (STATE(d))
+ 	{

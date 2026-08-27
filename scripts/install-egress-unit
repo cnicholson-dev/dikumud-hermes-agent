@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# Make the SEC-07 egress rules survive a reboot, so nobody has to remember
+# them.
+#
+# WHAT THIS SOLVES
+#   scripts/restrict-relay-egress writes host firewall state, and nothing
+#   reapplies it at boot. The relay refuses to start without those rules, so
+#   the stack fails loudly rather than running unrestricted, but on a machine
+#   that reboots it means the stack stays down until someone runs a sudo
+#   command by hand. That is the wrong kind of manual step: it is required,
+#   it is always the same, and forgetting it looks like a broken deployment.
+#
+# WHAT IT INSTALLS
+#   One systemd unit that applies the rules at boot and removes them on
+#   shutdown, with the repository path baked in rather than left as a
+#   placeholder to edit.
+#
+#   Three things about its ordering are deliberate, and are why this is a
+#   script rather than a paragraph telling you to write the unit yourself:
+#
+#   After=network-online.target
+#       `apply` resolves openrouter.ai and REFUSES to install a rule set if it
+#       cannot, because a rule set with no allowed destination denies
+#       everything and stops the relay. At boot, After=docker.service alone can
+#       run before DNS works, and the unit fails.
+#
+#   ExecStartPre waits for DOCKER-USER
+#       The rules hang off Docker's DOCKER-USER chain, which dockerd creates
+#       during startup. `docker.service has started` does not guarantee the
+#       chain exists yet, and `iptables -I DOCKER-USER` against a missing chain
+#       leaves the RELAY-EGRESS chain installed but unreferenced: rules that
+#       exist and filter nothing. The relay's own self-test would still catch
+#       it, but this is cheaper than finding out that way.
+#
+#   PartOf=docker.service
+#       Restarting the Docker daemon flushes its chains, taking the reference
+#       with it. PartOf makes this unit restart when docker does, so the rules
+#       are reinstalled instead of quietly disappearing.
+#
+# AFTER INSTALLING
+#   scripts/1.start-stack notices the unit and stops asking for sudo. The rules
+#   are still verified from inside the containers by the SEC-07 rows of
+#   scripts/verify-network-boundaries, which is the check that actually
+#   matters; the relay still self-tests and still refuses to start without
+#   them.
+#
+#   The upstream is Cloudflare-fronted and its address set rotates, so a rule
+#   set pinned at boot can drift. `apply` re-resolves every time it runs, which
+#   is at every boot and every `scripts/1.start-stack --build`-style start that
+#   does not skip it. If the relay ever starts failing to reach the endpoint,
+#   public-documentation/OPERATIONS.md section 0.1 is that symptom, and the fix
+#   is one `systemctl restart relay-egress`.
+#
+#   sudo scripts/install-egress-unit [--remove]
+#
+# Exit codes: 0 installed or removed, 1 a step failed, 2 usage.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+UNIT=/etc/systemd/system/relay-egress.service
+NAME=relay-egress.service
+
+fail() { echo "install-egress-unit: $*" >&2; exit 1; }
+say()  { printf '%-16s %s\n' "$1" "$2"; }
+
+case "${1:-}" in
+  ""|--install) MODE=install ;;
+  --remove)     MODE=remove ;;
+  -h|--help)
+    echo "usage: sudo scripts/install-egress-unit [--remove]" >&2
+    exit 2
+    ;;
+  *) echo "install-egress-unit: unknown option: $1" >&2; exit 2 ;;
+esac
+
+[ "$(id -u)" -eq 0 ] ||
+  fail "this needs root: it writes $UNIT and manages a systemd unit"
+
+command -v systemctl >/dev/null 2>&1 ||
+  fail "systemd is not available on this host;
+public-documentation/OPERATIONS.md section 10 describes what to do instead"
+
+[ -x "$REPO/scripts/restrict-relay-egress" ] ||
+  fail "$REPO/scripts/restrict-relay-egress is missing or not executable"
+
+if [ "$MODE" = remove ]; then
+  systemctl disable --now "$NAME" >/dev/null 2>&1 || true
+  rm -f "$UNIT"
+  systemctl daemon-reload
+  say "removed" "$UNIT"
+  say "" "the rules themselves were taken out by the unit's ExecStop"
+  say "" "reapply them by hand with: sudo scripts/restrict-relay-egress apply"
+  exit 0
+fi
+
+cat > "$UNIT" <<EOF
+# Installed by $REPO/scripts/install-egress-unit
+# Do not edit here: reinstall from the repository so the two cannot disagree.
+[Unit]
+Description=Restrict openrouter-relay egress (SEC-07)
+Documentation=file://$REPO/public-documentation/OPERATIONS.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# dockerd creates DOCKER-USER during startup; having started is not the same as
+# having created it, and installing into a chain that is not there yet leaves
+# rules that filter nothing.
+#
+# Written without a shell variable or a command substitution on purpose:
+# systemd expands \$FOO and \${FOO} in Exec lines itself, so a counting loop
+# here would have its variables eaten before /bin/sh ever saw them. The wait is
+# bounded by TimeoutStartSec instead, which fails the unit rather than hanging
+# the boot.
+ExecStartPre=/bin/sh -c 'until iptables -S DOCKER-USER >/dev/null 2>&1; do sleep 1; done'
+ExecStart=$REPO/scripts/restrict-relay-egress apply
+ExecStop=$REPO/scripts/restrict-relay-egress remove
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable "$NAME" >/dev/null
+say "installed" "$UNIT"
+
+systemctl restart "$NAME" ||
+  fail "the unit failed to start; systemctl status $NAME has the reason"
+say "started" "$(systemctl is-active "$NAME"), enabled at boot"
+
+echo
+"$REPO/scripts/restrict-relay-egress" verify | head -6
+cat <<EOF
+
+The rules are applied now and will be reapplied at every boot and whenever the
+Docker daemon restarts. scripts/1.start-stack will stop asking for sudo.
+
+  systemctl status relay-egress     what it did
+  systemctl restart relay-egress    re-resolve the upstream and reinstall
+  sudo scripts/install-egress-unit --remove
+
+EOF

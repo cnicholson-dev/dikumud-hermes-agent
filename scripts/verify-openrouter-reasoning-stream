@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+# Streamed-reasoning shape check for the spectator's live reasoning feed.
+#
+# PURPOSE
+#   The relay has never consumed upstream SSE. `sse.py` only synthesises it
+#   outbound, from an already-complete payload, so nothing in this repository
+#   establishes what a streamed chunk from these models actually looks like.
+#   Before `upstream.py` can write reasoning deltas to a feed as they arrive,
+#   two things have to be observed rather than assumed:
+#
+#     1. Which key under `choices[].delta` carries reasoning. The strip guard
+#        at upstream.py already enumerates three candidates, because a
+#        completed response has been seen to use them:
+#            reasoning, reasoning_content, reasoning_details
+#        A streamed chunk need not use the same one.
+#
+#     2. Whether `usage` still arrives. This is the one that bites silently.
+#        `app.py` records the token budget from `payload["usage"]` after every
+#        successful call; a streamed response that omits it would have the
+#        ledger recording zeros for every request while looking healthy, and
+#        the spectator's `tokens` line would sit at 0 in / 0 out forever. The
+#        probe therefore asks for `stream_options: {include_usage: true}` and
+#        reports whether that is enough.
+#
+#   Reasoning is NOT excluded here, deliberately. That matches what the relay
+#   will send once validate.py stops forcing it off: the field is omitted
+#   entirely, so the model applies its own default effort.
+#
+# CREDENTIAL HANDLING
+#   Identical to scripts/verify-openrouter-tool-calling. The key is NEVER
+#   passed on the command line (argv is world-readable via /proc) and is NEVER
+#   echoed. Supply it one of two ways:
+#
+#     A. File (preferred; mirrors the Docker secret used in production):
+#          OPENROUTER_API_KEY_FILE=~/.config/dikumud-hermes/openrouter.key \
+#            scripts/verify-openrouter-reasoning-stream <model-id>
+#
+#     B. Environment, exported in the operator's own shell:
+#          read -rs OPENROUTER_API_KEY && export OPENROUTER_API_KEY
+#          scripts/verify-openrouter-reasoning-stream <model-id>
+#
+#   Do not paste the key into a chat session, a commit, or a transcript.
+#
+# COST
+#   One request. Free models bill nothing; the only budget it touches is the
+#   daily request count, which is 1000/day on a key with credits behind it.
+#
+# EXIT CODES
+#   0 reasoning deltas observed; the field name is reported and the feed can
+#     be built against it
+#   1 model reachable and streaming, but no reasoning deltas arrived
+#   2 credential missing or unusable
+#   3 transport/upstream failure
+
+set -euo pipefail
+
+# No default model, deliberately: a default is one more place a model
+# identifier is written down, and it silently checks the shipped set rather than
+# whatever the deployment pinned. Every model in config/relay/models.toml should
+# be checked, because the relay may serve any of them, and one whose stream
+# shape differs would write nothing to the feed at exactly the moment the model
+# ahead of it was unavailable.
+if [[ $# -lt 1 || -z "${1:-}" ]]; then
+    echo "usage: scripts/verify-openrouter-reasoning-stream <model-id>" >&2
+    echo "The ids are in config/relay/models.toml; check every one of them." >&2
+    exit 2
+fi
+MODEL="$1"
+ENDPOINT="https://openrouter.ai/api/v1/chat/completions"
+
+command -v jq >/dev/null 2>&1 || { echo "FAIL: jq is required" >&2; exit 2; }
+
+if [[ -n "${OPENROUTER_API_KEY_FILE:-}" ]]; then
+    [[ -r "$OPENROUTER_API_KEY_FILE" ]] || { echo "FAIL: key file unreadable" >&2; exit 2; }
+    KEY="$(<"$OPENROUTER_API_KEY_FILE")"
+elif [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+    KEY="$OPENROUTER_API_KEY"
+else
+    echo "FAIL: set OPENROUTER_API_KEY_FILE or OPENROUTER_API_KEY. See header." >&2
+    exit 2
+fi
+KEY="${KEY//[$'\r\n']/}"
+[[ -n "$KEY" ]] || { echo "FAIL: credential is empty" >&2; exit 2; }
+
+# Deliberately non-game, like its sibling: this proves stream mechanics only
+# and keeps the probe free of DikuMUD semantics. A question with a small amount
+# of actual work in it, so the model has something to think about and the
+# reasoning deltas are not empty.
+read -r -d '' PAYLOAD <<JSON || true
+{
+  "model": "${MODEL}",
+  "messages": [
+    {"role": "user", "content": "A rope ladder hangs over the side of a ship, with rungs one foot apart. The tide rises one foot per hour. After three hours, how many rungs are underwater? Answer in one sentence."}
+  ],
+  "max_tokens": 512,
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}
+JSON
+
+RAW="$(mktemp)"; trap 'rm -f "$RAW"' EXIT
+# -N disables curl's output buffering, so this is a real stream rather than a
+# response that happens to be chunked. -H reads the key from a shell variable;
+# it is never printed and never logged.
+HTTP="$(curl -sS -N --max-time 180 -o "$RAW" -w '%{http_code}' \
+    -H "Authorization: Bearer ${KEY}" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" "$ENDPOINT")" || { echo "FAIL: transport error" >&2; exit 3; }
+unset KEY
+
+if [[ "$HTTP" != "200" ]]; then
+    # Only the upstream message, never headers or a request echo.
+    echo "FAIL: HTTP $HTTP - $(jq -r '.error.message // "no message"' "$RAW" 2>/dev/null)" >&2
+    [[ "$HTTP" == "401" || "$HTTP" == "403" ]] && exit 2
+    exit 3
+fi
+
+# The SSE payloads, one JSON object per line, terminator dropped. sed here
+# processes a pipeline rather than a file.
+CHUNKS="$(mktemp)"; trap 'rm -f "$RAW" "$CHUNKS"' EXIT
+grep '^data: ' "$RAW" | sed 's/^data: //' | grep -v '^\[DONE\]$' > "$CHUNKS" || true
+
+TOTAL="$(wc -l < "$CHUNKS" | tr -d ' ')"
+if [[ "$TOTAL" == "0" ]]; then
+    echo "FAIL: a 200 with no SSE data lines; the endpoint did not stream." >&2
+    exit 3
+fi
+
+echo "model asked  : $MODEL"
+echo "served model : $(jq -rs '[.[].model] | map(select(. != null)) | first // "unknown"' "$CHUNKS")"
+echo "chunks       : $TOTAL"
+echo
+
+echo "delta keys observed, with the number of chunks carrying each:"
+jq -rs '[.[].choices[]?.delta // {} | keys[]] | group_by(.) | map({k: .[0], n: length})
+        | sort_by(-.n)[] | "  \(.n)\t\(.k)"' "$CHUNKS"
+echo
+
+# The question this script exists to answer.
+FIELD=""
+for candidate in reasoning reasoning_content reasoning_details; do
+    n="$(jq -rs --arg c "$candidate" \
+        '[.[].choices[]?.delta[$c]? | select(. != null and . != "")] | length' "$CHUNKS")"
+    if [[ "$n" != "0" ]]; then
+        echo "reasoning field: delta.$candidate  ($n non-empty chunks)"
+        [[ -z "$FIELD" ]] && FIELD="$candidate"
+    fi
+done
+
+if [[ -z "$FIELD" ]]; then
+    # An unavailable endpoint and a model that streams no reasoning both end up
+    # here, and they call for opposite responses: one is the ordinary fallback
+    # case, the other means the feed cannot be built for this model.
+    # The chunks themselves are the only thing that tells them apart, so they
+    # are printed rather than summarised away.
+    echo
+    ERR="$(jq -rs '[.[].error?.message // .[].choices[]?.error?.message]
+                   | map(select(. != null)) | first // empty' "$CHUNKS" 2>/dev/null || true)"
+    if [[ -n "$ERR" ]]; then
+        echo "upstream said  : $ERR" >&2
+        echo
+        echo "RESULT: FAIL - the endpoint answered with an error inside a 200 stream." >&2
+        echo "  This is an availability failure, not a statement about the model's" >&2
+        echo "  reasoning support. Retry when the endpoint is serving." >&2
+        exit 3
+    fi
+    echo "the chunks, verbatim (first 3):" >&2
+    head -3 "$CHUNKS" | fold -s -w 76 | sed 's/^/  /' >&2
+    echo
+    echo "RESULT: FAIL - no reasoning arrived in any delta. If the chunks above" >&2
+    echo "  carry content but no reasoning, the feed cannot be built against" >&2
+    echo "  this model's stream; check whether it needs an explicit" >&2
+    echo "  reasoning:{effort} rather than the default." >&2
+    exit 1
+fi
+
+# A sample, so a reader can see this is genuine thinking rather than an echo of
+# the answer. Truncated: the point is the shape, not the content.
+echo
+echo "first 300 characters of the reasoning stream:"
+jq -rs --arg f "$FIELD" \
+    '[.[].choices[]?.delta[$f]? | select(type == "string")] | join("") | .[0:300]' \
+    "$CHUNKS" | fold -s -w 76 | sed 's/^/  /'
+echo
+
+# Content deltas, so task 4 knows both halves of the assembly.
+CONTENT_N="$(jq -rs '[.[].choices[]?.delta.content? | select(. != null and . != "")] | length' "$CHUNKS")"
+echo "content deltas : $CONTENT_N"
+echo "finish reason  : $(jq -rs '[.[].choices[]?.finish_reason?] | map(select(. != null)) | last // "none"' "$CHUNKS")"
+
+# The silent one. See the header.
+USAGE="$(jq -rs '[.[].usage? | select(. != null)] | last // empty' "$CHUNKS")"
+if [[ -n "$USAGE" ]]; then
+    echo "usage          : $(jq -rc '{prompt_tokens, completion_tokens}' <<<"$USAGE")"
+else
+    echo "usage          : ABSENT" >&2
+    echo
+    echo "  Warning: no usage block arrived even with stream_options.include_usage." >&2
+    echo "  app.py records the token budget from payload['usage'] after every" >&2
+    echo "  success, so a streamed path must reconstruct it or the ledger will" >&2
+    echo "  record zeros while looking healthy. Task 4 has to handle this." >&2
+fi
+
+echo
+echo "RESULT: PASS - reasoning streams as delta.$FIELD; record it in the Phase 0 record."

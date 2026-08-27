@@ -1,0 +1,51 @@
+# Credentials must never enter history.
+# The OpenRouter key and the DikuMUD character credential live outside this
+# tree; these patterns are a second line of defence, not the primary control.
+*.key
+*.pem
+secrets/
+.env
+.env.*
+!.env.example
+
+# Rotated credential backups. The rotation procedure in
+# public-documentation/OPERATIONS.md and
+# scripts/4.load-character write these beside the credential they replace.
+# Those files live outside this tree, so these patterns exist to stop a stray
+# copy from following one in.
+*.bak
+*.pre-rotation
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build and runtime artifacts
+*.o
+dmserver
+delplay
+
+# Volume backups (public-documentation/OPERATIONS.md section 7). These hold the
+# player file,
+# the agent's learning and its profile: runtime state, not source, and not
+# something to carry in a portfolio repository.
+backups/
+
+# Session captures (scripts/capture-session). One directory per session,
+# holding that session's game text, transcript, final frame, client log and
+# recording. Same category as the backups above: what a run produced, not what
+# produces a run. Promoting a capture into public-documentation/demo/ is a
+# deliberate act with the disclosure review public-documentation/DEMO.md
+# describes.
+sessions/
+
+# Local coding-agent state: resume files and session checkpoints belong to the
+# machine that wrote them. This was previously covered only by
+# .git/info/exclude, which is local to one clone and does not travel with the
+# repository.
+.claude/
+
+# macOS directory metadata.
+.DS_Store

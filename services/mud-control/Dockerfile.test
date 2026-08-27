@@ -1,0 +1,16 @@
+# Test image: the runtime image plus the pinned test dependencies.
+# Kept separate so the release image carries no test tooling.
+# Tracks the tag compose builds. Pinning this to a stale phase tag makes the
+# suite pass against source the deployment no longer runs, which it silently
+# did until Phase 8 added a module the pinned image did not contain.
+ARG BASE=mud-control:phase7
+FROM ${BASE}
+USER root
+COPY requirements-dev.txt /tmp/requirements-dev.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-dev.txt \
+ && rm /tmp/requirements-dev.txt
+COPY pytest.ini /opt/mud-control/pytest.ini
+COPY tests/ /opt/mud-control/tests/
+USER 10002:10002
+WORKDIR /opt/mud-control
+CMD ["python", "-m", "pytest"]

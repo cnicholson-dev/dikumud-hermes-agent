@@ -1,0 +1,25 @@
+#nop ---------------------------------------------------------------------
+#nop  TinTin++ session configuration for mud-control.
+#nop
+#nop  Loaded as: tt++ -G -T -s -r <generated file>
+#nop
+#nop  Comments MUST use #nop. In TinTin++ '#' introduces a command, so a
+#nop  plain '#'-prefixed comment line is executed, fails as an unknown
+#nop  command, and can be forwarded to the game as text. That happened
+#nop  during Phase 2 and put junk on the login prompt.
+#nop
+#nop  Order matters: the harness prepends '#session' before this file,
+#nop  because CONFIG options are per-session. Applied before a session
+#nop  exists they would land on the global pseudo-session, leaving the real
+#nop  link without VERBATIM or CHILD LOCK.
+#nop
+#nop  This file defines no aliases, triggers, substitutions, highlights,
+#nop  events, macros, paths, or scripts, and loads no automapper.
+#nop ---------------------------------------------------------------------
+
+#config {VERBATIM}      {ON}
+#config {CHILD LOCK}    {ON}
+#config {SPEEDWALK}     {OFF}
+#config {SCREEN READER} {ON}
+#config {COLOR PATCH}   {OFF}
+#config {COMMAND ECHO}  {OFF}

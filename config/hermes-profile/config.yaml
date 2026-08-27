@@ -1,0 +1,155 @@
+# Hermes profile for the DikuMUD player. SEED FILE.
+#
+# This is the seed for $HERMES_HOME/config.yaml on the hermes-player volume.
+# Hermes normalises this file at startup: it reorders keys, adds
+# _config_version, and maintains known_builtin_toolsets. The authoritative
+# runtime copy therefore lives in the volume, and this file exists so the
+# starting state is reproducible rather than assembled by hand.
+#
+# Two things learned in Phase 5 that this file depends on:
+#
+# 1. platform_toolsets alone does NOT close the tool surface. A builtin
+#    toolset Hermes has not seen before defaults to ENABLED. On a fresh
+#    volume the "bfl" video toolset was enabled despite never being listed.
+#    known_builtin_toolsets below is what marks a toolset as seen, so
+#    everything not in platform_toolsets is genuinely off. If a future Hermes
+#    version adds a toolset, it will appear enabled until it is added here.
+#    Re-run the inventory after any image bump.
+#
+# 2. Hermes re-adds "kanban" to platform_toolsets on startup. It is not a
+#    known toolset: `hermes tools disable kanban` answers "Unknown toolset",
+#    and it appears nowhere in `hermes tools list`. It grants nothing, and it
+#    is stripped here rather than left sitting in an allowlist.
+#
+# 3. Neither "skills" nor "memory" is enabled, and that is a decision rather
+#    than a deferral. Both write into this container's own
+#    volume, and neither can be schema-validated against this project's
+#    content policy, timestamped per record, or audited outside the agent.
+#    skill_manage additionally offers write_file and remove_file, which is the
+#    arbitrary write path the capability boundary forbids.
+#    SECURITY.md section 9 requires every persistence write to be validated,
+#    bounded, timestamped and externally audited, and requires stored content
+#    to be revalidated on load, which cannot be done to a store Hermes reads
+#    from its own files at session start.
+#
+#    Learning therefore lives behind the validated MCP boundary served by
+#    mud-control on port 8766. public-documentation/DESIGN.md section 8 has the
+#    store and its bounds.
+#
+# The capability boundary this enforces is enumerated in
+# public-documentation/DESIGN.md section 5.1.
+
+# `default` must be the FIRST model in `order` in the relay's configuration
+# (config/relay/models.toml). Do not edit it by hand:
+# scripts/set-model-order writes this line and the relay's order together, and
+# scripts/1.start-stack refuses to start the stack when the two disagree.
+#
+# The relay discards whatever model a request names and substitutes its own
+# first ordered model, so a mismatch misroutes nothing. What it does is leave
+# the client asking a catalog that does not list its configured model, and
+# leave this seed claiming a different model played than the one that did.
+#
+# Changing it here changes the starting state only. The authoritative copy is
+# $HERMES_HOME/config.yaml on the hermes-player volume, which no script edits,
+# and it needs the same value; see public-documentation/OPERATIONS.md section 12.
+model:
+  default: nvidia/nemotron-3-ultra-550b-a55b:free
+  provider: custom
+  base_url: http://openrouter-relay:8080/v1
+agent:
+  max_iterations: 120
+tool_loop_guardrails:
+  enabled: true
+memory:
+  enabled: false
+skills:
+  enabled: false
+streaming:
+  enabled: false
+_config_version: 37
+platform_toolsets:
+  cli: []
+mcp_servers:
+  mud:
+    url: http://mud-control:8765/mcp
+    timeout: 120
+    connect_timeout: 60
+    sampling:
+      enabled: false
+  learn:
+    url: http://mud-control:8766/mcp
+    timeout: 120
+    connect_timeout: 60
+    sampling:
+      enabled: false
+known_plugin_toolsets:
+  cli:
+    - a2a
+    - spotify
+known_builtin_toolsets:
+  cli:
+    - bfl
+    - browser
+    - clarify
+    - code_execution
+    - computer_use
+    - context_engine
+    - cronjob
+    - delegation
+    - discord
+    - discord_admin
+    - file
+    - homeassistant
+    - image_gen
+    - memory
+    - session_search
+    - skills
+    - spotify
+    - stt
+    - terminal
+    - todo
+    - tts
+    - video
+    - video_gen
+    - vision
+    - web
+    - x_search
+    - yuanbao
+
+# ── Security ──────────────────────────────────────────────────────────
+# Secret redaction is ON by default — strings that look like API keys,
+# tokens, and passwords are masked in tool output, logs, and chat
+# responses before the model or user ever sees them. Set redact_secrets
+# to false to disable (e.g. when developing the redactor itself).
+# tirith pre-exec scanning is enabled by default when the tirith binary
+# is available. Configure via security.tirith_* keys or env vars
+# (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
+#
+# security:
+#   redact_secrets: true
+#   tirith_enabled: true
+#   tirith_path: "tirith"
+#   tirith_timeout: 5
+#   tirith_fail_open: true
+
+# ── Fallback Model ────────────────────────────────────────────────────
+# Automatic provider failover when primary is unavailable.
+# Uncomment and configure to enable. Triggers on rate limits (429),
+# overload (529), service errors (503), or connection failures.
+#
+# Supported providers:
+#   openrouter   (OPENROUTER_API_KEY)  — routes to any model
+#   openai-codex (OAuth — hermes auth) — OpenAI Codex
+#   nous         (OAuth — hermes auth) — Nous Portal
+#   zai          (ZAI_API_KEY)         — Z.AI / GLM
+#   kimi-coding  (KIMI_API_KEY)        — Kimi / Moonshot
+#   kimi-coding-cn (KIMI_CN_API_KEY)   — Kimi / Moonshot (China)
+#   minimax      (MINIMAX_API_KEY)     — MiniMax
+#   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
+#   bedrock      (AWS IAM / boto3)     — AWS Bedrock (Converse API)
+#
+# For custom OpenAI-compatible endpoints, add base_url and key_env.
+#
+# fallback_model:
+#   provider: openrouter
+#   model: anthropic/claude-sonnet-4

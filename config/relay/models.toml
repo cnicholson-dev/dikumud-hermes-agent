@@ -1,0 +1,102 @@
+# The models openrouter-relay may request, and the order it tries them in.
+#
+# This file is the deployment's copy. compose mounts it read-only at
+# /etc/openrouter-relay/models.toml and the relay reads it once at startup: a
+# change takes effect on the next restart of that service and never mid-session.
+# Point RELAY_MODEL_CONFIG_FILE at another path in .env to keep it outside the
+# repository.
+#
+# Change the order with the script rather than by hand, because the agent's
+# profile has to name the same first model and scripts/1.start-stack refuses to
+# start the stack when the two disagree:
+#
+#     scripts/set-model-order lightning ultra
+#     scripts/set-model-order --list
+#
+# What this file can and cannot do:
+#
+#   - `order` may name only models defined below, at most four of them, each
+#     once. A model defined and not ordered is parked, not deleted.
+#   - A caller still cannot select a model. The `model` field in a request is
+#     discarded and the first ordered model substituted, whichever it is.
+#   - Only the first ordered model is ever advertised at /v1/models. The rest
+#     exist as far as the operator is concerned and not as far as the agent is.
+#   - The relay refuses to start on a file it cannot parse or validate, on a
+#     model that does not advertise `tools` and `tool_choice`, and on an order
+#     naming a model with no table. There is no partial load.
+#
+# Every attempt but the last is bounded by RELAY_PRIMARY_TIMEOUT and the last
+# by RELAY_UPSTREAM_TIMEOUT, so three ordered models is 45 + 45 + 120 seconds
+# of waiting before a turn fails at the shipped defaults. See .env.example:
+# RELAY_PRIMARY_TIMEOUT=25 keeps three models at roughly the pair's worst case.
+#
+# Before adding or changing a model, work through the capability checklist in
+# public-documentation/OPERATIONS.md section 12 and run
+#
+#     scripts/verify-openrouter-tool-calling <model-id>
+#
+# for it. A model that cannot emit a tool call cannot play the game at all, and
+# the failure looks like an agent that talks instead of acting. Every value
+# below was read from the live catalog and endpoint records on 2026-08-22 and
+# is recorded in public-documentation/DEPENDENCY_RECORD.md section 4.
+
+version = 2
+
+order = [
+  "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "nvidia/nemotron-3.5-lightning:free",
+]
+
+# Provider tags come from `endpoints[].tag`, never from `provider_name`. The
+# display name "Nvidia" is accepted by the API and then matches nothing, and
+# the request comes back 404, which is indistinguishable from a missing model.
+# Tags may be qualified by quantisation, as Lightning's is.
+
+[models."nvidia/nemotron-3-ultra-550b-a55b:free"]
+providers = ["nvidia"]
+name = "NVIDIA: Nemotron 3 Ultra (free)"
+context_length = 1000000
+max_completion_tokens = 65536
+pricing_prompt = "0"
+pricing_completion = "0"
+supported_parameters = ["include_reasoning", "max_tokens", "reasoning",
+                        "reasoning_effort", "seed", "temperature",
+                        "tool_choice", "tools", "top_p"]
+reasoning_default_effort = "high"
+reasoning_supported_efforts = ["high", "medium"]
+
+[models."nvidia/nemotron-3-super-120b-a12b:free"]
+providers = ["nvidia"]
+name = "NVIDIA: Nemotron 3 Super (free)"
+context_length = 262144
+max_completion_tokens = 262144
+pricing_prompt = "0"
+pricing_completion = "0"
+# Advertises response_format and structured_outputs as well; they are absent
+# here because the relay's own ceiling does not include them, and listing a
+# parameter the relay will never forward would only make this file look like
+# it decides more than it does.
+supported_parameters = ["include_reasoning", "max_tokens", "reasoning",
+                        "reasoning_effort", "seed", "temperature",
+                        "tool_choice", "tools", "top_p"]
+# Lower than Ultra's, which is why the catalog cannot be a constant: the client
+# clamps its requested effort to whatever the first ordered model advertises.
+reasoning_default_effort = "medium"
+reasoning_supported_efforts = ["medium", "low"]
+
+[models."nvidia/nemotron-3.5-lightning:free"]
+providers = ["nvidia/nvfp4"]
+name = "NVIDIA: Nemotron 3.5 Lightning (free)"
+context_length = 1000000
+max_completion_tokens = 65536
+pricing_prompt = "0"
+pricing_completion = "0"
+# No reasoning_effort, which is why the effective allowlist is eight rather
+# than nine whenever this model is in the order: the same validated body goes
+# to whichever model answers, and a 4xx does not fall back.
+supported_parameters = ["include_reasoning", "max_tokens", "reasoning",
+                        "seed", "temperature", "tool_choice", "tools", "top_p"]
+# Its reasoning metadata is {"mandatory": false} and nothing else: no efforts,
+# no default. Absent here rather than invented, so /v1/models carries no
+# reasoning block while this model leads.

@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# Start the four-service stack in the order the deployment actually requires.
+#
+# Compose already orders the services and this script does not repeat that:
+# mud-control waits for a healthy dikumud, and hermes-player for a healthy
+# mud-control and openrouter-relay. What compose cannot order is the step that
+# is not a container. SEC-07 is host firewall state, the relay self-tests for it
+# at startup and exits when it is absent, so applying it after `compose up`,
+# which is the order the quick start shows, fails on any host that has since
+# rebooted: the relay exits and hermes-player reports `dependency failed to
+# start`. It goes first here.
+#
+# Re-applying the rules on every start is deliberate rather than defensive. The
+# upstream is Cloudflare-fronted, its address set rotates, and
+# `restrict-relay-egress apply` re-resolves it; a stale set is exactly the
+# symptom public-documentation/OPERATIONS.md section 0.1 describes. Apply
+# removes its own chain before installing it again, so running it repeatedly is
+# safe.
+#
+#   scripts/1.start-stack [--build] [--skip-egress] [--skip-verify] [--timeout N]
+#
+# Exit codes: 0 started, 1 a check or a service failed, 2 usage, otherwise the
+# exit code of verify-network-boundaries.
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+SERVICES=(dikumud mud-control openrouter-relay hermes-player)
+BUILD=0
+SKIP_EGRESS=0
+SKIP_VERIFY=0
+TIMEOUT=180
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/1.start-stack [--build] [--skip-egress] [--skip-verify] [--timeout N]
+
+  --build         rebuild the three locally built images first
+  --skip-egress   do not apply the SEC-07 host firewall rules, for a deployment
+                  that restricts the relay's egress some other way
+  --skip-verify   do not run scripts/verify-network-boundaries at the end
+  --timeout N     seconds to wait for all four services to report healthy
+                  (default 180)
+EOF
+  exit 2
+}
+
+fail() { echo "1.start-stack: $*" >&2; exit 1; }
+say()  { printf '%-16s %s\n' "$1" "$2"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --build)       BUILD=1 ;;
+    --skip-egress) SKIP_EGRESS=1 ;;
+    --skip-verify) SKIP_VERIFY=1 ;;
+    --timeout)
+      shift
+      [ $# -gt 0 ] || usage
+      TIMEOUT="$1"
+      ;;
+    -h|--help)     usage ;;
+    *) echo "1.start-stack: unknown option: $1" >&2; usage ;;
+  esac
+  shift
+done
+
+case "$TIMEOUT" in
+  ''|*[!0-9]*) fail "--timeout takes a whole number of seconds" ;;
+esac
+
+# -- preflight, before anything is started ---------------------------------
+#
+# Every one of these produces a failure that is harder to read once it comes
+# back through compose: a missing secret file surfaces as an unhealthy
+# container, and an unset SECRETS_DIR as a bind mount of a path that does not
+# exist.
+preflight() {
+  [ -f .env ] || fail ".env is missing. Copy .env.example and set SECRETS_DIR."
+
+  set -a
+  # shellcheck source=/dev/null
+  . ./.env
+  set +a
+
+  [ -n "${SECRETS_DIR:-}" ] || fail "SECRETS_DIR is not set in .env"
+  [ -d "$SECRETS_DIR" ] || fail "SECRETS_DIR is not a directory: $SECRETS_DIR"
+
+  local secret
+  for secret in game-credential openrouter.key; do
+    [ -s "$SECRETS_DIR/$secret" ] ||
+      fail "missing or empty secret: $SECRETS_DIR/$secret"
+    [ -r "$SECRETS_DIR/$secret" ] ||
+      fail "not readable: $SECRETS_DIR/$secret (see .env.example for the modes)"
+  done
+
+  # The pinned model set. Checked here for the same reason the
+  # secrets are: compose creates a DIRECTORY when a bind source is missing, so
+  # a deleted or mistyped path would reach the relay as an unreadable mount and
+  # come back as an unhealthy container rather than as the one-line problem it
+  # is.
+  local models="${RELAY_MODEL_CONFIG_FILE:-config/relay/models.toml}"
+  [ -f "$models" ] ||
+    fail "the relay's model configuration is missing: $models
+Restore it, or point RELAY_MODEL_CONFIG_FILE in .env at the file you use."
+  [ -r "$models" ] || fail "not readable: $models"
+
+  # The relay substitutes its first ordered model into every request, so a
+  # disagreement here does not misroute anything. What it does is leave the
+  # agent asking a catalog that does not list its configured model, and leave
+  # the seed profile claiming a different model played than the one that did.
+  #
+  # Reads the first entry of `order`. This used to read [primary].id
+  # from the version 1 schema, and after the schema changed it silently
+  # extracted nothing, which turns a refusal into a check that passes because
+  # it compared an empty string. Hence the "could not read" case below: a check
+  # that cannot run says so rather than looking like agreement.
+  local pinned profile
+  pinned="$(awk '/^order[[:space:]]*=[[:space:]]*\[/ {inside = 1; next}
+                 inside && /^\]/                    {inside = 0; next}
+                 inside {gsub(/[",[:space:]]/, ""); if ($0) {print; exit}}' \
+                 "$models")"
+  profile="$(awk '/^model:/{f=1;next} /^[^[:space:]]/{f=0}
+                  f&&/^[[:space:]]+default:/{print $2; exit}' \
+                  config/hermes-profile/config.yaml 2>/dev/null)"
+  [ -n "$pinned" ] ||
+    fail "could not read the first model from $models. The file should have an
+`order = [...]` list naming models it defines; see
+public-documentation/OPERATIONS.md section 12."
+  if [ -n "$profile" ] && [ "$pinned" != "$profile" ]; then
+    fail "the relay and the agent profile name different models:
+  $models
+    first in order  $pinned
+  config/hermes-profile/config.yaml
+    model.default   $profile
+Fix it with: scripts/set-model-order $pinned
+The seed profile follows the relay, not the other way around."
+  fi
+
+  docker compose version >/dev/null 2>&1 ||
+    fail "docker compose v2 is not available"
+  docker info >/dev/null 2>&1 ||
+    fail "the Docker daemon is not responding"
+
+  say "preflight" "ok, character ${MUD_CHARACTER:-Wren}"
+  say "" "model ${pinned:-unread} from $models"
+}
+
+# -- SEC-07, which is host state and not a container ------------------------
+apply_egress() {
+  if [ "$SKIP_EGRESS" = 1 ]; then
+    say "egress" "skipped; the relay's own self-test still has to pass"
+    return
+  fi
+  # The systemd unit owns the rules when it is installed: it applies them at
+  # boot and reapplies them when the Docker daemon restarts, which is more
+  # than this script can do from here. Asking for sudo anyway would be a
+  # password prompt for work that is already done.
+  if systemctl is-active --quiet relay-egress.service 2>/dev/null; then
+    say "egress" "handled by relay-egress.service; no sudo needed"
+    return
+  fi
+  command -v sudo >/dev/null 2>&1 ||
+    fail "sudo is needed for the SEC-07 rules. Install the systemd unit with
+sudo scripts/install-egress-unit so they survive a reboot, or pass
+--skip-egress."
+  say "egress" "applying the SEC-07 rules (sudo)"
+  say "" "install them once with sudo scripts/install-egress-unit to stop this"
+  sudo scripts/restrict-relay-egress apply ||
+    fail "restrict-relay-egress apply failed; the relay will refuse to start"
+}
+
+# -- health --------------------------------------------------------------
+health_of() {
+  docker inspect \
+    -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+    "$1" 2>/dev/null || echo absent
+}
+
+diagnose() {
+  local service="$1" status="$2"
+  echo >&2
+  echo "1.start-stack: $service is $status, not healthy" >&2
+  echo >&2
+  docker compose ps >&2 || true
+  echo >&2
+  docker compose logs --tail 30 "$service" >&2 || true
+  if [ "$service" = openrouter-relay ] &&
+     docker compose logs --tail 50 "$service" 2>/dev/null |
+       grep -q EgressNotRestricted; then
+    cat >&2 <<'EOF'
+
+The relay reached an address it must not be able to reach, so it refused to
+start. Apply the rules and start again:
+
+  sudo scripts/restrict-relay-egress apply
+
+RELAY_EGRESS_SELFTEST=0 silences that message and leaves SEC-07 unmet.
+EOF
+  fi
+  exit 1
+}
+
+# Waits service by service, in the order compose brings them up, so the output
+# reads as the dependency chain resolving rather than as four parallel spinners.
+wait_for_health() {
+  local deadline=$(( SECONDS + TIMEOUT )) service status bad
+  for service in "${SERVICES[@]}"; do
+    bad=0
+    while :; do
+      status="$(health_of "$service")"
+      case "$status" in
+        healthy)
+          say "$service" "healthy"
+          break
+          ;;
+        exited|restarting|absent)
+          # One reading is not a verdict: a container being recreated reports
+          # these in passing. Three consecutive ones is a service that is not
+          # coming up at all, and waiting out the timeout would only delay the
+          # same diagnosis.
+          bad=$(( bad + 1 ))
+          if [ "$bad" -ge 3 ]; then
+            diagnose "$service" "$status"
+          fi
+          ;;
+        *)
+          bad=0
+          ;;
+      esac
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "1.start-stack: timed out after ${TIMEOUT}s" >&2
+        diagnose "$service" "$status"
+      fi
+      sleep 2
+    done
+  done
+}
+
+preflight
+apply_egress
+
+if [ "$BUILD" = 1 ]; then
+  docker compose up -d --build
+else
+  docker compose up -d
+fi
+
+echo
+wait_for_health
+
+if [ "$SKIP_VERIFY" = 0 ]; then
+  echo
+  scripts/verify-network-boundaries || exit $?
+fi
+
+cat <<'EOF'
+
+The stack is up, and nothing plays until you start a session:
+
+  scripts/2.start-agent     # plays one session and watches it
+
+Take it all down again with scripts/3.stop-stack.
+
+EOF

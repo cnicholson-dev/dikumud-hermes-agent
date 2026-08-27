@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# Start a run as a character that does not exist yet.
+#
+# WHAT THIS CREATES, AND WHAT IT DOES NOT
+#   It creates the secret half of a character: a name and a password, on the
+#   shelf at ${SECRETS_DIR}/characters/<Name>, and it loads them. It does not
+#   create the character in the game, and nothing on the host could.
+#   scripts/bootstrap-character records why, from Phase 1:
+#
+#       DikuMUD does not write a character record until creation finishes.
+#       Stopping at the sex prompt and disconnecting therefore leaves nothing
+#       in the player file
+#
+#   So the character comes into existence during the agent's first session:
+#   mud-control answers the identity prompts, which is where the secret is, and
+#   stops. Sex and class are gameplay choices and belong to the agent through
+#   mud_act: the bootstrap owns the secret identity only, and the model makes
+#   every non-secret creation choice itself.
+#
+#   That is why this script ends by printing a first-session command rather
+#   than running one. The default prompt in scripts/2.start-agent tells the
+#   agent to read its notes and continue where they stop, which is the wrong
+#   thing to say to a character that has no notes and is standing at a sex
+#   prompt.
+#
+#   scripts/5.new-character <Name>
+#
+# Exit codes: 0 created and loaded, 1 a check failed, 2 usage.
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/5.new-character <Name>
+
+Generates a password, writes ${SECRETS_DIR}/characters/<Name>, and loads it
+with scripts/4.load-character. The name must be 2-15 letters, must not already
+be on the shelf, and must not already exist in the game.
+
+The character itself is created by the agent during its first session, when it
+answers the game's sex and class prompts through mud_act.
+EOF
+  exit 2
+}
+
+fail() { echo "5.new-character: $*" >&2; exit 1; }
+say()  { printf '%-16s %s\n' "$1" "$2"; }
+
+# shellcheck source=scripts/lib/session.sh
+. scripts/lib/session.sh
+
+case "${1:-}" in
+  ""|-h|--help) usage ;;
+esac
+NAME="$1"
+
+case "$NAME" in
+  *[!A-Za-z]*) fail "character name must be 2-15 alphabetic characters" ;;
+esac
+if [ "${#NAME}" -lt 2 ] || [ "${#NAME}" -gt 15 ]; then
+  fail "character name must be 2-15 alphabetic characters"
+fi
+
+[ -f .env ] || fail ".env is missing. Copy .env.example and set SECRETS_DIR."
+set -a
+# shellcheck source=/dev/null
+. ./.env
+set +a
+[ -n "${SECRETS_DIR:-}" ] || fail "SECRETS_DIR is not set in .env"
+
+SHELF="$SECRETS_DIR/characters/$NAME"
+[ -e "$SHELF" ] && fail "$NAME is already on the shelf at $SHELF.
+Load it with scripts/4.load-character $NAME."
+
+docker info >/dev/null 2>&1 || fail "the Docker daemon is not responding"
+
+# -- is the name free in the game? ----------------------------------------
+#
+# Asked from inside mud-control, because the host has no route to the game and
+# must not have one: SEC-06, which scripts/verify-network-boundaries tests from
+# inside the containers. The script is piped in rather than mounted, so nothing
+# about the container changes to answer one question.
+#
+# A name already in the player file would not fail loudly. The game would send
+# a password prompt, mud-control would answer with the password this script
+# just generated, and the session would fail authentication for a character the
+# operator believes is new.
+if running mud-control; then
+  say "name" "asking the game whether $NAME is taken"
+  set +e
+  docker compose exec -T mud-control python3 - --check-only "$NAME" \
+    --host "${MUD_CONTROL_HOST:-dikumud}" --port "${MUD_CONTROL_PORT:-4000}" \
+    < scripts/bootstrap-character
+  check=$?
+  set -e
+  case "$check" in
+    0) say "" "free" ;;
+    3) fail "$NAME already exists in the game. Pick another name, or load it
+with scripts/4.load-character $NAME once its password is on the shelf." ;;
+    *) fail "could not ask the game about $NAME (exit $check).
+The usual cause is that $NAME is the character currently linked: the game
+answers a second connection using an in-game name with neither a password
+prompt nor a creation prompt, so the probe cannot tell what it is looking at.
+Verified against this deployment: a free name answers 'is free', an existing
+one answers 'already exists', and the character that is playing answers
+neither. Refusing rather than guessing, because guessing 'free' here would
+create a character the game will not accept." ;;
+  esac
+else
+  say "name" "mud-control is not running; the game was not asked about $NAME"
+fi
+
+# -- the secret half -------------------------------------------------------
+#
+# Ten characters, which is DikuMUD's maximum: interpreter.c refuses anything
+# longer, and its DES hash is significant only to the first eight. Generated
+# rather than chosen, written with a private umask and then relaxed to 0644
+# inside the 0700 directory for the reason .env.example gives about compose and
+# file modes. It is never printed: the operator does not need to know it, and
+# nothing but mud-control ever reads it.
+mkdir -p -m 700 "$SECRETS_DIR/characters"
+(
+  umask 077
+  {
+    printf '%s\n' "$NAME"
+    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 10
+    printf '\n'
+  } > "$SHELF"
+)
+chmod 644 "$SHELF"
+say "shelf" "$SHELF written"
+
+# -- load it ---------------------------------------------------------------
+scripts/4.load-character "$NAME"
+
+cat <<EOF
+$NAME does not exist in the game yet. It will be created during its first
+session: mud-control answers the name, confirmation and password prompts, and
+then stops, because sex and class are the agent's choices to make through
+mud_act.
+
+The default prompt tells the agent to read notes it does not have, so start
+this one with a prompt that fits:
+
+  scripts/2.start-agent --turns 40 -q "You are new here. Answer the game's
+  creation questions one at a time with mud_act, then look around and start
+  learning where you are."
+
+EOF

@@ -1,0 +1,5 @@
+# Test-only dependencies for the mud-control service.
+# Runtime deps are in requirements.txt and are not duplicated here.
+-c requirements.txt
+pytest>=8.4.2
+pytest-asyncio>=1.2.0

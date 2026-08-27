@@ -1,0 +1,44 @@
+[1mWren[0m[2m  a supervised DikuMUD session[0m
+
+[2m-- play --------------------------------------------------------------------------------------------[0m
+  [2m11:29:45[0m  [1mwest                    [0mGoing west from Poor Alley to see what lies further down the al…
+  [2m11:30:00[0m  [1mlook                    [0mExamining Wall Road to see the description and any details like…
+  [2m11:30:23[0m  [1mnorth                   [0mGoing north on Wall Road to see what lies ahead
+  [2m11:30:51[0m  [1mnorth                   [0mGoing north on Wall Road to approach the West Gate
+  [2m11:31:02[0m  [1mwest                    [0mGoing west from Inside West Gate to Outside West Gate
+  [2m11:31:23[0m  [1mwest                    [0mGoing west from Outside West Gate into the edge of the big fore…
+  [2m11:31:28[0m  [1mread sign               [0mReading the large sign mounted on a pole at the edge of the for…
+  [2m11:31:36[0m  [1mwest                    [0mTaking a few steps west into the Forest of Haon-Dor to observe …
+  [2mlast refusal: not_ready[0m
+
+[2m-- session -----------------------------------------------------------------------------------------[0m
+  state       READY[2m  prompt -[0m
+  duration    16 min[2m  since this session opened[0m
+  commands    40[2m  refused 6[0m
+  stopped     [2mnot stopped[0m
+
+[2m-- learning  24 facts, 1 procedures ----------------------------------------------------------------[0m
+  General Store: inside, all sorts of items stacked on shelves behind counter out …[2m  [place,shop][0m
+  Eastern End of Poor Alley: Madam Esther standing here trying to sell dust. South …[2m  [place,npc][0m
+  Leather Shop: large room with acrid smell, walls with shelves of animal hide, fi…[2m  [place,shop][0m
+  Trail through the light forest: leading east to forest edge and west further into the…[2m  [place][0m
+  [2mprocedure:[0m How to approach a place I have never been
+  [2mlast change: fact_added fact-0026[0m
+
+[2m-- model -------------------------------------------------------------------------------------------[0m
+  requests    103[2m  ok 101  refused 3  remaining 297[0m
+  tokens      1900796 in  27222 out
+  latency     p50 4232 ms[2m  p95 22516 ms  max 119392 ms[0m
+  model       nemotron-3-super-120b-a12b:free[2m  fell back 10x from the primary[0m
+
+[2m-- reasoning ---------------------------------------------------------------------------------------[0m
+  [2m·[0m  acting, 37s                [2mlast sent west at 11:31:36[0m
+  - Wall Road description
+  - Forest of Haon-Dor trail description
+
+  The exploration has been systematic, moving westward from the town center through various
+  districts and into the wilderness. I'm currently on a trail leading into the Forest of Haon-Dor.
+
+
+  --- end stop ---
+

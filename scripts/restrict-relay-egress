@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# SEC-07: restrict openrouter-relay to the OpenRouter path only.
+#
+# Compose can decide WHICH networks a service joins, but not which destinations
+# it may reach on one of them. net_egress is a normal bridge with NAT, so a
+# service attached to it can reach anything the host can. Phase 7 measured that
+# directly: from inside the relay, github.com:22 and example.com:80 were both
+# reachable. The relay's own policy pins the upstream URL, so a working relay
+# only talks to OpenRouter, but that is an application control, and SEC-07 asks
+# for a network one.
+#
+# This installs the network control, in a dedicated chain so it can be removed
+# again without disturbing anything else Docker put in DOCKER-USER.
+#
+# Requires root. Run it on the Docker host:
+#
+#   sudo scripts/restrict-relay-egress apply
+#   sudo scripts/restrict-relay-egress verify
+#   sudo scripts/restrict-relay-egress remove
+#
+# Re-run `apply` after `docker compose down`/`up` only if the egress subnet
+# changed; the rules key off the subnet, not off container addresses, and
+# compose.yaml pins that subnet precisely so these rules stay valid.
+
+set -euo pipefail
+
+# Must match the net_egress ipam subnet in compose.yaml.
+EGRESS_SUBNET="${EGRESS_SUBNET:-172.31.243.0/28}"
+CHAIN="RELAY-EGRESS"
+UPSTREAM_HOST="${UPSTREAM_HOST:-openrouter.ai}"
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "This needs root: iptables rules are host state." >&2
+    exit 1
+  fi
+}
+
+resolve_upstream() {
+  # A records only. Cloudflare fronts this host, so the set rotates; see the
+  # note in public-documentation/OPERATIONS.md about re-running apply if the
+  # relay starts failing to reach the endpoint.
+  getent ahostsv4 "$UPSTREAM_HOST" | awk '{print $1}' | sort -u
+}
+
+apply() {
+  need_root
+  local ips
+  ips="$(resolve_upstream)"
+  if [ -z "$ips" ]; then
+    echo "Could not resolve $UPSTREAM_HOST; refusing to install a rule set" >&2
+    echo "that would deny everything and stop the relay." >&2
+    exit 1
+  fi
+
+  remove_quiet
+
+  iptables -N "$CHAIN"
+  # Return traffic for connections the relay opened.
+  iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
+  # DNS is NOT allowed by default, and the relay still resolves.
+  #
+  # The first version of this script allowed udp/53 and tcp/53 to anywhere, on
+  # the assumption that the relay needs to resolve its upstream. Checked
+  # afterwards: /etc/resolv.conf inside the container is 127.0.0.11, Docker's
+  # embedded resolver, which lives in the container's own network namespace.
+  # The forwarded query leaves from the daemon on the host, so it never appears
+  # as traffic from this subnet and never reaches this chain. The rules were
+  # dead weight, and DNS to an arbitrary resolver is a low-bandwidth
+  # exfiltration channel worth closing.
+  #
+  # Set ALLOW_DNS=1 if a deployment points the container at an external
+  # resolver instead of the embedded one; resolution failing is the symptom.
+  if [ "${ALLOW_DNS:-0}" = "1" ]; then
+    echo "  allowing DNS (ALLOW_DNS=1)"
+    iptables -A "$CHAIN" -p udp --dport 53 -j RETURN
+    iptables -A "$CHAIN" -p tcp --dport 53 -j RETURN
+  fi
+  # The upstream itself, HTTPS only.
+  local ip
+  for ip in $ips; do
+    echo "  allowing 443 to $ip ($UPSTREAM_HOST)"
+    iptables -A "$CHAIN" -d "$ip" -p tcp --dport 443 -j RETURN
+  done
+  # Anything else from the egress subnet is denied. REJECT rather than DROP so
+  # a misconfiguration fails fast and visibly instead of hanging.
+  iptables -A "$CHAIN" -j REJECT --reject-with icmp-admin-prohibited
+
+  # Send only this subnet's traffic through the chain.
+  iptables -I DOCKER-USER -s "$EGRESS_SUBNET" -j "$CHAIN"
+  echo "applied: $EGRESS_SUBNET may reach DNS and $UPSTREAM_HOST:443, nothing else"
+}
+
+remove_quiet() {
+  iptables -D DOCKER-USER -s "$EGRESS_SUBNET" -j "$CHAIN" 2>/dev/null || true
+  iptables -F "$CHAIN" 2>/dev/null || true
+  iptables -X "$CHAIN" 2>/dev/null || true
+}
+
+remove() {
+  need_root
+  remove_quiet
+  echo "removed: $EGRESS_SUBNET has unrestricted egress again"
+}
+
+verify() {
+  need_root
+  echo "--- DOCKER-USER jump ---"
+  iptables -S DOCKER-USER | grep -- "$EGRESS_SUBNET" || echo "  (no jump installed)"
+  echo "--- $CHAIN ---"
+  iptables -S "$CHAIN" 2>/dev/null || echo "  (chain absent)"
+  cat <<'EOF'
+
+Now confirm from inside the container, which is the evidence SEC-07 wants:
+
+  docker compose exec -T openrouter-relay python3 -c "
+import socket
+print(socket.getaddrinfo('openrouter.ai',443,socket.AF_INET)[0][4][0], 'resolved')
+for h,p in [('openrouter.ai',443),('1.1.1.1',443),('8.8.8.8',53),('example.com',80),('github.com',22)]:
+    try:
+        s=socket.create_connection((h,p),4); s.close(); print(f'{h}:{p} REACHABLE')
+    except Exception as e: print(f'{h}:{p} blocked ({type(e).__name__})')
+"
+
+Expected: the name resolves, openrouter.ai:443 is reachable, and the rest,
+including DNS to an external resolver, are blocked.
+EOF
+}
+
+case "${1:-}" in
+  apply)  apply ;;
+  remove) remove ;;
+  verify) verify ;;
+  *) echo "usage: $0 {apply|verify|remove}" >&2; exit 2 ;;
+esac

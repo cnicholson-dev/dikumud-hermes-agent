@@ -1,0 +1,277 @@
+# The complete four-service deployment.
+#
+# One internal network per authorized flow rather than a shared game network;
+# dedicated non-root identities and narrow writable paths; the learning MCP
+# endpoint on 8766 separate from the five MUD tools on 8765. Nothing here
+# publishes a port. public-documentation/DESIGN.md section 4.1 has the topology.
+#
+# Start it with:   docker compose up -d --build
+# Play a session:  docker compose exec hermes-player hermes chat -q "..."
+#
+# Secrets are files on the host, outside this repository, named by SECRETS_DIR
+# in .env. They are never baked into an image, never passed as environment,
+# and each is granted to exactly one service.
+
+name: dikumud-hermes-agent-player
+
+# ---------------------------------------------------------------------------
+# Controls that apply to every service.
+#
+# YAML anchors rather than repetition: a hardening block that has to be copied
+# four times is a hardening block that will differ in one of them eventually,
+# and SEC-01 through SEC-03 are exactly the kind of thing that fails silently
+# when one service drifts.
+# ---------------------------------------------------------------------------
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  # Bounded so a loop or a leak stays inside its own container. SEC-10.
+  pids_limit: 512
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # -------------------------------------------------------------------------
+  # The game. Reachable only by mud-control, with no route out.
+  # -------------------------------------------------------------------------
+  dikumud:
+    <<: *hardening
+    build:
+      context: ./services/dikumud
+    image: dikumud:${DIKUMUD_TAG:-phase7}
+    container_name: dikumud
+    user: "10001:10001"
+    networks: [net_mcp_game]
+    volumes:
+      - vol_dikumud_data:/var/lib/dikumud/data
+    mem_limit: 256m
+    cpus: 0.50
+    # The image carries its own HEALTHCHECK: a TCP accept on the game port.
+
+  # -------------------------------------------------------------------------
+  # The MCP boundary and the TinTin++ process it owns. Two private endpoints:
+  # 8765 for the five MUD tools, 8766 for the six learning tools.
+  # -------------------------------------------------------------------------
+  mud-control:
+    <<: *hardening
+    build:
+      context: ./services/mud-control
+    image: mud-control:${MUD_CONTROL_TAG:-phase7}
+    container_name: mud-control
+    user: "10002:10002"
+    networks:
+      net_hermes_mcp:
+        ipv4_address: 172.31.240.3
+      net_mcp_game:
+    depends_on:
+      dikumud:
+        condition: service_healthy
+    secrets:
+      - game_credential
+    environment:
+      MUD_CONTROL_HOST: dikumud
+      MUD_CONTROL_PORT: "4000"
+      MUD_CONTROL_CHARACTER: ${MUD_CHARACTER:-Wren}
+      MUD_CONTROL_CREDENTIAL_FILE: /run/secrets/game_credential
+      # Bound to this service's address on net_hermes_mcp only.
+      #
+      # Phase 7 measured the effective graph and found that dikumud could open
+      # a connection to mud-control:8765. The two share net_mcp_game for the
+      # Telnet flow, Docker networks are bidirectional, and a listener on
+      # 0.0.0.0 answers on every attached network. That put the MCP boundary
+      # within reach of the one service running unmodified 1991 C code, which
+      # is the specific thing SECURITY.md section 10 lists as a threat.
+      #
+      # Binding to a fixed address on the agent's network closes it without a
+      # capability, a firewall, or a change to the listener code, and SEC-08
+      # now tests it from dikumud's side.
+      MUD_CONTROL_BIND: 172.31.240.3
+    volumes:
+      - vol_mudcontrol_audit:/var/log/mud-control
+      - vol_mudcontrol_learning:/var/lib/mud-control/learning
+    tmpfs:
+      # The PTY scratch and the generated session file. Owned by the service
+      # uid because TinTin++ writes here as itself.
+      - /tmp:uid=10002,gid=10002,mode=1700
+    mem_limit: 512m
+    cpus: 1.00
+
+  # -------------------------------------------------------------------------
+  # The only service with a route off this host, and the only holder of the
+  # API key. Fixed upstream, and a model pair fixed before startup by a
+  # read-only file the agent cannot reach; not a general proxy.
+  # -------------------------------------------------------------------------
+  openrouter-relay:
+    <<: *hardening
+    build:
+      context: ./services/openrouter-relay
+    image: openrouter-relay:${RELAY_TAG:-phase7}
+    container_name: openrouter-relay
+    user: "10003:10003"
+    networks:
+      net_hermes_relay:
+        ipv4_address: 172.31.241.3
+      net_egress:
+    secrets:
+      - openrouter_api_key
+    environment:
+      RELAY_PORT: "8080"
+      RELAY_API_KEY_FILE: /run/secrets/openrouter_api_key
+      # Same reasoning as mud-control: bound to the agent-facing network only,
+      # so the relay does not answer on the network that carries its egress.
+      RELAY_BIND: 172.31.241.3
+      # The pinned model set. Setting this makes the file mandatory: the
+      # relay refuses to start when it cannot be read or validated, rather than
+      # falling back to the copy packaged in the image. That is the whole point
+      # of naming it here, because a bind mount that silently did not happen
+      # would otherwise look exactly like a working deployment.
+      RELAY_MODEL_CONFIG: /etc/openrouter-relay/models.toml
+      # Model-fallback tuning. Forwarded explicitly rather than
+      # inherited, so the set of settings the relay honours stays visible here
+      # and an unset variable falls back to the default in policy.py. The
+      # timeouts live there; the model ids do not.
+      RELAY_FALLBACK: ${RELAY_FALLBACK:-1}
+      RELAY_PRIMARY_TIMEOUT: ${RELAY_PRIMARY_TIMEOUT:-45}
+      RELAY_UPSTREAM_TIMEOUT: ${RELAY_UPSTREAM_TIMEOUT:-120}
+      # How long a request waits for a rate-limit slot before being refused.
+      # Forwarded for the same reason as the others: a setting the
+      # relay honours should be visible here rather than only in its source.
+      RELAY_MAX_RATE_WAIT: ${RELAY_MAX_RATE_WAIT:-30}
+      # The spectator's live reasoning feed. Forwarded for the same reason as
+      # the settings above: a setting the relay honours should be visible here
+      # rather than only in its source. It is written to the tmpfs declared
+      # below, so it never touches disk and dies with the container, and it is
+      # a file rather than an endpoint because scripts/spectate reads /metrics
+      # from inside hermes-player: anything served over HTTP here would be
+      # readable by the agent too. Set to an empty string to run without one.
+      RELAY_REASONING_LOG: ${RELAY_REASONING_LOG:-/tmp/reasoning.log}
+      RELAY_REASONING_LOG_BYTES: ${RELAY_REASONING_LOG_BYTES:-256000}
+    volumes:
+      # One file, read-only, and the only mount this service has. SECURITY.md
+      # section 4 permits exactly this and nothing wider: not the directory,
+      # not writable, and not the repository. RELAY_MODEL_CONFIG_FILE in .env
+      # points it at a path outside the repository for a deployment that wants
+      # its policy kept with its secrets rather than with its source.
+      - ${RELAY_MODEL_CONFIG_FILE:-./config/relay/models.toml}:/etc/openrouter-relay/models.toml:ro
+    tmpfs:
+      - /tmp:uid=10003,gid=10003,mode=1700
+    mem_limit: 256m
+    cpus: 0.50
+    # The image carries its own HEALTHCHECK against /healthz.
+
+  # -------------------------------------------------------------------------
+  # The agent. No secret, no egress, and no network path to the game: it
+  # cannot even resolve the name dikumud.
+  #
+  # The container idles and a session is started with `compose exec`, which is
+  # what keeps the demonstration supervised rather than unattended.
+  # -------------------------------------------------------------------------
+  hermes-player:
+    <<: *hardening
+    image: nousresearch/hermes-agent@${HERMES_DIGEST:-sha256:22e37bb4ed1b0f50cb6bd991dca7ecacd6c9f29df9b4a20fc989d32bc763ccf6}
+    container_name: hermes-player
+    user: "10000:10000"
+    command: ["sleep", "infinity"]
+    networks: [net_hermes_mcp, net_hermes_relay]
+    depends_on:
+      mud-control:
+        condition: service_healthy
+      openrouter-relay:
+        condition: service_healthy
+    volumes:
+      - vol_hermes_state:/opt/data
+    tmpfs:
+      # exec is required: the s6 supervision tree runs scripts from /run.
+      - /run:uid=10000,gid=10000,exec
+      - /tmp:uid=10000,gid=10000,exec
+    mem_limit: 2g
+    cpus: 2.00
+    healthcheck:
+      # Declared here rather than in a Dockerfile because this image is
+      # upstream and is used by digest, unmodified. Running the CLI proves the
+      # supervision tree and the Python environment are both usable, which a
+      # file check would not.
+      test: ["CMD", "hermes", "--version"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+# ---------------------------------------------------------------------------
+# One internal network per authorized flow. A single shared network
+# would let any member reach any other member on any port, which is what
+# SEC-08 requires to fail.
+# ---------------------------------------------------------------------------
+#
+# Subnets are fixed because two listeners bind to an address rather than to
+# 0.0.0.0; see the MUD_CONTROL_BIND comment above for why. A /28 is more than
+# this stack will ever need and keeps the ranges out of the way of Docker's
+# default 172.17-172.30 allocations.
+networks:
+  net_hermes_mcp:
+    name: net_hermes_mcp
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.240.0/28
+  net_hermes_relay:
+    name: net_hermes_relay
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.241.0/28
+  net_mcp_game:
+    name: net_mcp_game
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.242.0/28
+  net_egress:
+    name: net_egress
+    # The one network with a route out, attached to one service.
+    internal: false
+    ipam:
+      config:
+        - subnet: 172.31.243.0/28
+
+# ---------------------------------------------------------------------------
+# One volume per service responsibility. No volume is shared between two
+# services, which is what SEC-09 tests.
+# ---------------------------------------------------------------------------
+volumes:
+  vol_dikumud_data:
+    name: vol_dikumud_data
+  vol_mudcontrol_audit:
+    name: vol_mudcontrol_audit
+  vol_mudcontrol_learning:
+    name: vol_mudcontrol_learning
+  vol_hermes_state:
+    name: vol_hermes_state
+
+# ---------------------------------------------------------------------------
+# File-based secrets, mounted at /run/secrets/<name>, each granted to exactly
+# one service.
+#
+# Outside swarm, Compose bind-mounts these with the HOST file's ownership and
+# mode; it does not remap them, and the `uid`/`gid`/`mode` attributes of the
+# long syntax are ignored. Tested here, not assumed: with the key at 0600 owned
+# by the operator, the relay running as its own uid 10003 could not read it and
+# crash-looped. Running the relay as the file's owner works around that, but it
+# gives up the dedicated non-root identity every service is required to keep.
+#
+# The resolution is that the DIRECTORY is the access control, not the file
+# mode: ${SECRETS_DIR} is 0700 so no other host user can traverse it, and the
+# files inside are world-readable so each container's own uid can read the one
+# it is granted. See .env.example, which sets them up in that order.
+# ---------------------------------------------------------------------------
+secrets:
+  game_credential:
+    file: ${SECRETS_DIR}/game-credential
+  openrouter_api_key:
+    file: ${SECRETS_DIR}/openrouter.key

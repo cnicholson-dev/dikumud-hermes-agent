@@ -1,0 +1,25 @@
+diff -ruN ref/db.c work/db.c
+--- ref/db.c	2026-08-20 10:23:08.688556858 -0400
++++ work/db.c	2026-08-20 10:23:24.982272469 -0400
+@@ -29,6 +29,7 @@
+ 
+ struct zone_data *zone_table;         /* table of reset data             */
+ int top_of_zone_table = 0;
++struct reset_q_type reset_q;          /* the zone-reset update queue     */
+ struct message_list fight_messages[MAX_MESSAGES]; /* fighting messages   */
+ struct player_index_element *player_table = 0; /* index to player file   */
+ int top_of_p_table = 0;               /* ref to top of table             */
+diff -ruN ref/db.h work/db.h
+--- ref/db.h	2026-08-20 10:23:08.688647307 -0400
++++ work/db.h	2026-08-20 10:23:13.639392573 -0400
+@@ -147,7 +147,9 @@
+ {
+ 	struct reset_q_element *head;
+ 	struct reset_q_element *tail;
+-} reset_q;
++};
++
++extern struct reset_q_type reset_q;
+ 
+ 
+ 

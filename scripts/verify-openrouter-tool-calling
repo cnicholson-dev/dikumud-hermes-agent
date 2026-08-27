@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+# Phase 0 minimal OpenRouter tool-calling compatibility check.
+#
+# PURPOSE
+#   Confirms that the fixed model can emit a tool call through the exact
+#   OpenAI-compatible path openrouter-relay will use. This is the last
+#   outstanding item of the Phase 0 gate.
+#
+# CREDENTIAL HANDLING
+#   The key is NEVER passed on the command line (argv is world-readable via
+#   /proc) and is NEVER echoed. Supply it one of two ways:
+#
+#     A. File (preferred; mirrors the Docker secret used in production).
+#        Keep it OUTSIDE the repository tree: this directory becomes a git repo
+#        in Phase 8, and a key inside it is one `git add -A` from being committed.
+#          mkdir -p ~/.config/dikumud-hermes && chmod 700 ~/.config/dikumud-hermes
+#          ( umask 077; read -rs KEY && printf '%s' "$KEY" > ~/.config/dikumud-hermes/openrouter.key )
+#          OPENROUTER_API_KEY_FILE=~/.config/dikumud-hermes/openrouter.key \
+#            scripts/verify-openrouter-tool-calling
+#
+#     B. Environment, exported in the operator's own shell:
+#          read -rs OPENROUTER_API_KEY && export OPENROUTER_API_KEY
+#          scripts/verify-openrouter-tool-calling
+#
+#   Do not paste the key into a chat session, a commit, or a transcript.
+#
+# EXIT CODES
+#   0 model returned a well-formed tool call  (Phase 0 model check PASSES)
+#   1 model reachable but did not produce a usable tool call (FAILS)
+#   2 credential missing or unusable
+#   3 transport/upstream failure
+
+set -euo pipefail
+
+# The model under test, named on the command line. Every model in
+# config/relay/models.toml must pass this check independently, because the relay
+# may serve any of them and a fallback that cannot emit a tool call is not a
+# fallback:
+#
+#   scripts/verify-openrouter-tool-calling nvidia/nemotron-3-ultra-550b-a55b:free
+#
+# There is no default. A default is one more place a model identifier is written
+# down, and it silently checks the shipped set rather than whatever the
+# deployment actually pinned.
+#
+# Defined once and substituted into the payload below. It was previously
+# written out twice, which meant the request could ask for one model while the
+# check compared against another.
+if [[ $# -lt 1 || -z "${1:-}" ]]; then
+    echo "usage: scripts/verify-openrouter-tool-calling <model-id>" >&2
+    echo "The ids are in config/relay/models.toml; check every one of them." >&2
+    exit 2
+fi
+MODEL="$1"
+ENDPOINT="https://openrouter.ai/api/v1/chat/completions"
+
+if [[ -n "${OPENROUTER_API_KEY_FILE:-}" ]]; then
+    [[ -r "$OPENROUTER_API_KEY_FILE" ]] || { echo "FAIL: key file unreadable" >&2; exit 2; }
+    KEY="$(<"$OPENROUTER_API_KEY_FILE")"
+elif [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+    KEY="$OPENROUTER_API_KEY"
+else
+    echo "FAIL: set OPENROUTER_API_KEY_FILE or OPENROUTER_API_KEY. See header." >&2
+    exit 2
+fi
+KEY="${KEY//[$'\r\n']/}"
+[[ -n "$KEY" ]] || { echo "FAIL: credential is empty" >&2; exit 2; }
+
+# Deliberately non-game payload: proves tool-calling mechanics only, and keeps
+# the probe free of any DikuMUD semantics or world knowledge.
+read -r -d '' PAYLOAD <<JSON || true
+{
+  "model": "${MODEL}",
+  "messages": [
+    {"role": "user", "content": "What is the weather in Copenhagen? Use the provided tool."}
+  ],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }
+  }],
+  "tool_choice": "auto",
+  "max_tokens": 512,
+  "reasoning": {"exclude": true}
+}
+JSON
+
+RESP="$(mktemp)"; trap 'rm -f "$RESP"' EXIT
+# -H reads the key from a shell variable; it is never printed and never logged.
+HTTP="$(curl -sS --max-time 120 -o "$RESP" -w '%{http_code}' \
+    -H "Authorization: Bearer ${KEY}" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" "$ENDPOINT")" || { echo "FAIL: transport error" >&2; exit 3; }
+unset KEY
+
+if [[ "$HTTP" != "200" ]]; then
+    # Print only the upstream message, never headers or request echo.
+    echo "FAIL: HTTP $HTTP - $(jq -r '.error.message // "no message"' "$RESP" 2>/dev/null)" >&2
+    [[ "$HTTP" == "401" || "$HTTP" == "403" ]] && exit 2
+    exit 3
+fi
+
+NAME="$(jq -r '.choices[0].message.tool_calls[0].function.name // empty' "$RESP")"
+ARGS="$(jq -r '.choices[0].message.tool_calls[0].function.arguments // empty' "$RESP")"
+FINISH="$(jq -r '.choices[0].finish_reason // "unknown"' "$RESP")"
+RETMODEL="$(jq -r '.model // "unknown"' "$RESP")"
+
+echo "served model : $RETMODEL"
+echo "finish reason: $FINISH"
+echo "tool call    : ${NAME:-<none>}"
+echo "arguments    : ${ARGS:-<none>}"
+
+if [[ -z "$NAME" ]]; then
+    echo "RESULT: FAIL - no tool call emitted; Hermes tool flow is unsupported on this endpoint." >&2
+    exit 1
+fi
+if ! jq -e . >/dev/null 2>&1 <<<"$ARGS"; then
+    echo "RESULT: FAIL - tool arguments are not valid JSON." >&2
+    exit 1
+fi
+# The same rule the relay applies in upstream.py's _model_matches: OpenRouter
+# reports the dated canonical slug for a ":free" alias, and both denote the one
+# pinned route. A stricter comparison here would report FAIL for a working
+# model whose endpoint happens to echo the slug, which is the sort of check
+# that gets distrusted instead of believed.
+if [[ "$RETMODEL" != "$MODEL" && "$RETMODEL" != "${MODEL%%:*}"* ]]; then
+    echo "RESULT: FAIL - upstream served '$RETMODEL', not the pinned model. Investigate routing/fallback." >&2
+    exit 1
+fi
+echo "RESULT: PASS - pinned model emitted a well-formed tool call."

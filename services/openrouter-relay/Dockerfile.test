@@ -1,0 +1,12 @@
+# Tracks the tag compose builds; see the note in mud-control/Dockerfile.test.
+ARG BASE=openrouter-relay:phase7
+FROM ${BASE}
+USER root
+COPY requirements-dev.txt /tmp/requirements-dev.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-dev.txt \
+ && rm /tmp/requirements-dev.txt
+COPY pytest.ini /opt/relay/pytest.ini
+COPY tests/ /opt/relay/tests/
+USER 10003:10003
+WORKDIR /opt/relay
+CMD ["python", "-m", "pytest"]

@@ -1,0 +1,37 @@
+diff -ruN ref/comm.c work/comm.c
+--- ref/comm.c	2026-08-20 11:42:28.081384635 -0400
++++ work/comm.c	2026-08-20 11:42:38.478030316 -0400
+@@ -572,13 +572,26 @@
+ 		exit (1);
+ 	}
+ 
+-	ld.l_onoff = 1;
+-	ld.l_linger = 1000;
+-	if (setsockopt(s, SOL_SOCKET, SO_LINGER, &ld, sizeof(ld)) < 0)
+-	{
+-		perror("setsockopt LINGER");
+-		exit(1);
+-	}
++	/*
++	*  SO_LINGER is deliberately NOT set.
++	*
++	*  The original set l_onoff = 1 with l_linger = 1000. SO_LINGER is measured
++	*  in SECONDS, so that asks close() to block for up to 1000 seconds while
++	*  unsent data drains. Accepted sockets inherit the option from the
++	*  listener, verified by getsockopt on an accepted descriptor, so every
++	*  client connection carried it.
++	*
++	*  close_socket() calls close(d->descriptor) first. When a client vanished
++	*  with output still queued, that close blocked, and because this server is
++	*  a single-threaded select loop the whole game froze: no accepts, no ticks,
++	*  no combat rounds, no logging, until TCP resolved the connection. Observed
++	*  as stalls of 26 to 37 seconds during Phase 1 verification.
++	*
++	*  Without the option, close() returns immediately and the kernel completes
++	*  the shutdown in the background, which is the correct behavior for a
++	*  server that must not block on any one peer.
++	*/
++	(void) ld;
+ 	if (bind(s, (struct sockaddr *) &sa, sizeof(sa)) < 0)
+ 	{
+ 		perror("bind");

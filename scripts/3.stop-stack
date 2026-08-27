@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# Stop the stack in the reverse of the order it starts, and end the play
+# session at the boundary rather than by killing what is holding it.
+#
+# The ordering that matters is not just compose's dependency graph run
+# backwards. A session that is still open when its containers stop ends as a
+# transport fault, because that is what it is: the client process went away
+# mid-connection. mud-control has a signal for the other case, and going
+# through it records an `operator` stop instead; scripts/lib/session.sh holds
+# that exchange, and scripts/4.load-character needs the same three steps before
+# it changes which character the credential file names. So this script stops
+# the client, records the reason at the boundary, captures what it just ended,
+# and then takes the containers down in order, giving the game a moment to see
+# its client's link close before its own process is stopped.
+#
+# The SEC-07 host firewall rules are deliberately left in place. They key off
+# the pinned net_egress subnet rather than off container addresses, so they stay
+# valid across a down/up cycle, and the relay refuses to start without them.
+# `sudo scripts/restrict-relay-egress remove` takes them out when that is what
+# you actually want.
+#
+#   scripts/3.stop-stack [--stop-only] [--timeout N]
+#
+# Exit codes: 0 stopped, 1 a step failed, 2 usage.
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+# Reverse of the startup chain: the agent, then the boundary it calls, then the
+# relay, and the game last because mud-control's TinTin++ is connected to it.
+ORDER=(hermes-player mud-control openrouter-relay dikumud)
+AUDIT=/var/log/mud-control/audit.jsonl
+STOP_ONLY=0
+TIMEOUT=20
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/3.stop-stack [--stop-only] [--timeout N]
+
+  --stop-only   leave the containers in place instead of removing them, for a
+                faster restart. Networks stay up too.
+  --timeout N   seconds each service gets to stop before SIGKILL (default 20)
+
+The four named volumes are never touched: game data, learning, audit record and
+the agent's state all survive either form of stop.
+EOF
+  exit 2
+}
+
+fail() { echo "3.stop-stack: $*" >&2; exit 1; }
+say()  { printf '%-16s %s\n' "$1" "$2"; }
+
+# running, audit_tail, current_session_id, running_character, stop_client,
+# end_session. Sourced after say/fail, which it calls.
+# shellcheck source=scripts/lib/session.sh
+. scripts/lib/session.sh
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --stop-only) STOP_ONLY=1 ;;
+    --timeout)
+      shift
+      [ $# -gt 0 ] || usage
+      TIMEOUT="$1"
+      ;;
+    -h|--help)   usage ;;
+    *) echo "3.stop-stack: unknown option: $1" >&2; usage ;;
+  esac
+  shift
+done
+
+case "$TIMEOUT" in
+  ''|*[!0-9]*) fail "--timeout takes a whole number of seconds" ;;
+esac
+
+docker info >/dev/null 2>&1 || fail "the Docker daemon is not responding"
+
+# -- 1. the client, and 2. the session, are in scripts/lib/session.sh -------
+
+# -- 3. the containers ----------------------------------------------------
+stop_services() {
+  local service
+  for service in "${ORDER[@]}"; do
+    if ! running "$service"; then
+      say "$service" "already stopped"
+      continue
+    fi
+    say "$service" "stopping"
+    docker compose stop -t "$TIMEOUT" "$service" >/dev/null 2>&1 ||
+      fail "could not stop $service"
+    # Let the game observe the closed link before its own process is stopped,
+    # rather than losing both ends in the same instant.
+    if [ "$service" = mud-control ]; then
+      sleep 2
+    fi
+  done
+}
+
+stop_client
+end_session
+
+# Captured before the containers go down, because every source a capture reads
+# is inside one of them. --if-new keeps this from writing a second copy of a
+# session scripts/2.start-agent already captured; the id in the audit record is
+# what makes that answerable rather than a guess. It cannot know where this
+# session's text began in the play log, so the slice is the whole current file
+# and the capture says so.
+scripts/capture-session --if-new || true
+
+stop_services
+
+if [ "$STOP_ONLY" = 1 ]; then
+  say "kept" "containers and networks in place (--stop-only)"
+else
+  docker compose down --remove-orphans >/dev/null 2>&1 ||
+    fail "docker compose down failed"
+  say "removed" "containers and networks"
+fi
+
+cat <<'EOF'
+
+Volumes are untouched: the character, its learning, the audit record and the
+agent's state are all still there. The SEC-07 egress rules are still applied,
+which is what the next start expects.
+
+  scripts/1.start-stack
+
+EOF

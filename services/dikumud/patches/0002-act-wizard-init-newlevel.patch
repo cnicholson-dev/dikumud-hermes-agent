@@ -1,0 +1,14 @@
+diff -ruN ref/act.wizard.c work/act.wizard.c
+--- ref/act.wizard.c	2026-08-20 10:18:53.324280702 -0400
++++ work/act.wizard.c	2026-08-20 10:18:59.619315161 -0400
+@@ -1356,7 +1356,10 @@
+ 	}
+ 
+ 	if (GET_LEVEL(victim) == 0)
++	{
+ 		adv = 1;
++		newlevel = GET_LEVEL(victim) + adv;
++	}
+ 	else if (!*level) {
+ 		send_to_char("You must supply a level number.\n\r", ch);
+ 		return;

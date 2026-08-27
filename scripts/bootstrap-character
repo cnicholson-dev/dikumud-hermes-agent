@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+"""
+Create the mortal demo account on a fresh DikuMUD player file.
+
+WHAT THIS OWNS
+    The secret-bearing account identity only: the character name and password.
+    Nothing else. The design (section 9) is explicit that "the bootstrap owns
+    secrets only. Character-building and in-game development remain the agent's
+    responsibility", and that the agent makes "all non-secret character-creation
+    choices - such as race, class, sex, and other ordinary game prompts -
+    through the same one-command MCP boundary".
+
+    DikuMUD's creation state machine cooperates with that split. From
+    structs.h, a new character walks:
+
+        CON_NME -> CON_NMECNF -> CON_PWDNEW -> CON_PWDNCNF
+                -> CON_QSEX -> CON_QCLASS -> CON_RMOTD -> CON_PLYNG
+
+    The secret-bearing states come first and finish before the choice states
+    begin, so this script drives the exchange up to and including password
+    confirmation and then stops. Sex and class are left unanswered for the
+    agent to make through mud_act in Phase 5.
+
+    IMPORTANT CONSEQUENCE, VERIFIED IN PHASE 1
+    DikuMUD does not write a character record until creation finishes. Stopping
+    at the sex prompt and disconnecting therefore leaves nothing in the player
+    file: the identity exists only in that connection's memory. Confirmed by
+    running this script and then dumping the player file, which contained the
+    completed sacrificial character and nothing else.
+
+    So the split above only works inside ONE live session, which is what the
+    design actually describes: mud-control authenticates, and the agent answers
+    the remaining prompts "through the same one-command MCP boundary". The
+    bootstrap is credential injection into a live session, not a separate
+    connection that hands off a half-made character.
+
+    --complete-creation exists only for verifying GAME-03 and GAME-04, which
+    need a persisted mortal character before any agent exists. The release path
+    must NOT use it: the model makes every non-secret creation choice, so the
+    demo character is finished by the agent against a player file holding only
+    the sacrificial character.
+
+WHY A SACRIFICIAL CHARACTER IS CREATED FIRST
+    db.c init_char() contains:
+
+        /* *** if this is our first player --- he be God *** */
+        if (top_of_p_table < 0)
+        {
+            GET_EXP(ch) = 7000000;
+            GET_LEVEL(ch) = 24;
+        }
+
+    On an empty player file the FIRST character created becomes a level 24
+    implementor. Release-blocking test GAME-03 requires the demo character to
+    hold no privileged commands, so this script creates a throwaway character
+    first and the demo character second. Verified: with the throwaway present,
+    the demo character starts at level 1 via do_start().
+
+    Do not delete the throwaway while it is the only account, or the next
+    character created becomes an implementor again.
+
+CREDENTIALS
+    Read from a file, never from argv and never from a chat transcript.
+    DikuMUD rejects passwords longer than 10 characters (interpreter.c:
+    strlen(arg) > 10), and the DES hash it stores is significant only to the
+    first 8, so a longer secret buys nothing here. That limit is a property of
+    the 1990 game, not a choice of this project; the credential is confined to
+    mud-control and never reaches the model.
+
+USAGE
+    DIKUMUD_CHARACTER_FILE=/run/secrets/dikumud_character \
+        scripts/bootstrap-character --host dikumud --port 4000
+
+    The credential file holds two lines:
+        <character name>
+        <password>
+
+    --check-only NAME asks whether a name is already taken and creates
+    nothing. It needs no credential file, because it never gets past the name
+    prompt. scripts/5.new-character calls it from inside mud-control, which is
+    the only container with a route to the game: the host has none, by design
+    (SEC-06, and scripts/verify-network-boundaries proves it).
+"""
+
+import argparse
+import os
+import re
+import socket
+import sys
+import time
+
+TELNET_IAC = 255
+
+
+def strip_telnet(raw: bytes) -> bytes:
+    out, i = bytearray(), 0
+    while i < len(raw):
+        if raw[i] == TELNET_IAC and i + 2 < len(raw):
+            i += 3
+        else:
+            out.append(raw[i])
+            i += 1
+    return bytes(out)
+
+
+class Session:
+    def __init__(self, host, port, timeout=20.0):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.sock.settimeout(0.5)
+        self.buf = ""
+
+    def wait_for(self, pattern, timeout=20.0):
+        rx = re.compile(pattern, re.I)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if rx.search(self.buf):
+                return True
+            try:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    return False
+                self.buf += strip_telnet(chunk).decode("latin-1")
+            except socket.timeout:
+                continue
+        return False
+
+    def send(self, line):
+        self.buf = ""
+        self.sock.sendall((line + "\n").encode("latin-1"))
+        time.sleep(0.4)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def read_credential(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        lines = [ln.strip() for ln in fh if ln.strip()]
+    if len(lines) < 2:
+        sys.exit("credential file must contain a name line and a password line")
+    name, password = lines[0], lines[1]
+    if not re.fullmatch(r"[A-Za-z]{2,15}", name):
+        sys.exit("character name must be 2-15 alphabetic characters")
+    if not 1 <= len(password) <= 10:
+        sys.exit("DikuMUD rejects passwords longer than 10 characters")
+    return name, password
+
+
+def account_exists(host, port, name):
+    """A known name is met with 'Password:'; an unknown one with a confirm."""
+    s = Session(host, port)
+    try:
+        if not s.wait_for(r"what name do you wish"):
+            sys.exit("no login banner; is the server up?")
+        s.send(name)
+        if not s.wait_for(r"Password:|Did I get that right"):
+            sys.exit("unexpected response after supplying the name")
+        return "password:" in s.buf.lower()
+    finally:
+        s.close()
+
+
+def create_secret_identity(host, port, name, password, stop_before_choices=True):
+    s = Session(host, port)
+    try:
+        if not s.wait_for(r"what name do you wish"):
+            sys.exit("no login banner; is the server up?")
+        s.send(name)
+
+        if not s.wait_for(r"Did I get that right"):
+            sys.exit(f"'{name}' already exists, or the name was refused")
+        s.send("Y")
+
+        if not s.wait_for(r"Give me a password"):
+            sys.exit("no password prompt")
+        s.send(password)
+
+        if not s.wait_for(r"retype password"):
+            sys.exit("no password confirmation prompt")
+        s.send(password)
+
+        if not s.wait_for(r"What is your sex"):
+            sys.exit("password was not accepted")
+
+        # The account identity now exists in the server's memory and the secret
+        # half of creation is done. Everything from here (sex, class) belongs to
+        # the agent, so hand back rather than answering.
+        if stop_before_choices:
+            return "identity established; sex and class left for the agent"
+
+        # Throwaway characters must be completed so the record reaches the
+        # player file and absorbs the implementor promotion.
+        s.send("M")
+        if not s.wait_for(r"Class *:"):
+            sys.exit("no class prompt for throwaway character")
+        s.send("W")
+        s.wait_for(r"PRESS RETURN", timeout=25)
+        s.send("")
+        s.wait_for(r"Make your choice", timeout=25)
+        s.send("0")
+        return "throwaway character completed"
+    finally:
+        s.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--host", default=os.environ.get("DIKUMUD_HOST", "dikumud"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("DIKUMUD_PORT", "4000")))
+    ap.add_argument("--throwaway-name", default="Zeroth",
+                    help="name for the sacrificial first character (GAME-03)")
+    ap.add_argument("--complete-creation", action="store_true",
+                    help="also answer sex and class so the demo character is "
+                         "persisted. Phase 1 verification only; the release "
+                         "path leaves these choices to the agent.")
+    ap.add_argument("--check-only", metavar="NAME",
+                    help="report whether NAME already exists in the game and "
+                         "exit, creating nothing and needing no credential "
+                         "file. Exit 0 when the name is free, 3 when it is "
+                         "taken. Used by scripts/5.new-character, which must "
+                         "not offer a name the game will refuse.")
+    args = ap.parse_args()
+
+    # Before the credential, deliberately: this asks the game a question about
+    # a name and needs no secret to do it.
+    if args.check_only:
+        if not re.fullmatch(r"[A-Za-z]{2,15}", args.check_only):
+            sys.exit("character name must be 2-15 alphabetic characters")
+        if account_exists(args.host, args.port, args.check_only):
+            print(f"[bootstrap] '{args.check_only}' already exists")
+            return 3
+        print(f"[bootstrap] '{args.check_only}' is free")
+        return 0
+
+    cred_path = os.environ.get("DIKUMUD_CHARACTER_FILE")
+    if not cred_path:
+        sys.exit("set DIKUMUD_CHARACTER_FILE to the credential file path")
+    name, password = read_credential(cred_path)
+
+    if account_exists(args.host, args.port, name):
+        print(f"[bootstrap] '{name}' already exists; nothing to do")
+        return 0
+
+    if not account_exists(args.host, args.port, args.throwaway_name):
+        print(f"[bootstrap] empty player file: creating sacrificial character "
+              f"'{args.throwaway_name}' so the demo character is not promoted "
+              f"to implementor (GAME-03)")
+        # Its password is random and discarded: nothing should ever log in as it.
+        throwaway_pw = os.urandom(8).hex()[:10]
+        print("[bootstrap]", create_secret_identity(
+            args.host, args.port, args.throwaway_name, throwaway_pw,
+            stop_before_choices=False))
+
+    print(f"[bootstrap] establishing secret identity for '{name}'")
+    print("[bootstrap]", create_secret_identity(
+        args.host, args.port, name, password,
+        stop_before_choices=not args.complete_creation))
+    if args.complete_creation:
+        print("[bootstrap] creation completed and persisted "
+              "(Phase 1 verification mode)")
+    else:
+        print("[bootstrap] identity is live in this session only; DikuMUD "
+              "persists nothing until creation finishes, so the agent must "
+              "complete it on the same connection")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

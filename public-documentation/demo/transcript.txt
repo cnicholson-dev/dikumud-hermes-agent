@@ -1,0 +1,47 @@
+11:15:53  session    resumed READY
+11:16:23  mud_act    look             | Checking my surroundings to see where I am
+11:16:36  mud_act    north            | Moving north to examine the temple altar area for any new details.
+11:16:48  mud_act    south            | Moving south from the altar to return to the southern end of the temple hall
+11:16:53  mud_act    down             | Going down to see what's below the temple
+11:18:27  mud_act    west             | Entering the Clerics Guild area to see what's there
+11:18:45  mud_act    east             | Going back east to temple square from Clerics Guild entrance
+11:18:51  mud_act    east             | Going east from temple square to the entrance of the Grunting Boar Inn
+11:20:24  mud_act    east             | Going east to the bar area of the Grunting Boar Inn
+11:20:30  mud_act    west             | Going west from the bar back to the entrance hall of the Grunting Boar Inn
+11:22:10  refused    not_ready
+11:22:16  mud_act    west             | Going west from the Grunting Boar Inn entrance hall back to temple square
+11:22:34  mud_act    south            | Going south from temple square towards market square
+11:22:46  mud_act    look statue      | Examining the peculiar statue in the middle of the market square to see if there are any details not previously noted.
+11:22:55  mud_act    east             | Going east from market square onto main street to see what lies that way
+11:23:04  mud_act    south            | Going south from main street to the Jeweller's Shop
+11:23:13  mud_act    west             | Going west from market square back onto main street
+11:23:21  refused    not_ready
+11:23:42  mud_act    look             | Examining the Jeweller's Shop to see description and possible exits
+11:24:17  mud_act    north            | Going north from Jeweller's Shop back to Main Street
+11:24:37  mud_act    north            | Going north from Main Street to the general store
+11:24:54  mud_act    east             | Going east from the General Store to see what lies further east on Main Street
+11:24:58  mud_act    look             | Looking around the General Store to see exits and details
+11:25:05  refused    not_ready
+11:25:10  mud_act    read note        | Reading the small note hanging on the wall in the General Store
+11:25:18  mud_act    south            | Going south from Jeweller's Shop to see what lies beyond
+11:25:32  mud_act    south            | Going south from Jeweller's Shop to Main Street
+11:27:53  refused    not_ready
+11:28:22  mud_act    look             | Examining Main Street to see the description and possible exits
+11:28:27  mud_act    north            | Going north from Jeweller's Shop back to Main Street
+11:28:35  mud_act    west             | Going west from Main Street back to Market Square
+11:28:39  mud_act    south            | Going south from Market Square to Common Square
+11:28:48  mud_act    west             | Going west from Common Square to Poor Alley
+11:28:56  mud_act    west             | Going west from Eastern End of Poor Alley to continue down the alley
+11:29:00  mud_act    north            | Going north from Poor Alley to the leather shop
+11:29:04  refused    not_ready
+11:29:20  mud_act    look             | Examining the leather shop to see what exits are available
+11:29:24  mud_act    south            | Going south from leather shop back to Poor Alley
+11:29:45  mud_act    west             | Going west from Poor Alley to see what lies further down the alley
+11:30:00  mud_act    look             | Examining Wall Road to see the description and any details like the writing on the wall
+11:30:02  refused    not_ready
+11:30:23  mud_act    north            | Going north on Wall Road to see what lies ahead
+11:30:51  mud_act    north            | Going north on Wall Road to approach the West Gate
+11:31:02  mud_act    west             | Going west from Inside West Gate to Outside West Gate
+11:31:23  mud_act    west             | Going west from Outside West Gate into the edge of the big forest
+11:31:28  mud_act    read sign        | Reading the large sign mounted on a pole at the edge of the forest
+11:31:36  mud_act    west             | Taking a few steps west into the Forest of Haon-Dor to observe the immediate surroundings

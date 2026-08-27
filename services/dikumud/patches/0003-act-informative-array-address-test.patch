@@ -1,0 +1,12 @@
+diff -ruN ref/act.informative.c work/act.informative.c
+--- ref/act.informative.c	2026-08-20 10:19:06.798937081 -0400
++++ work/act.informative.c	2026-08-20 10:19:11.471070271 -0400
+@@ -1016,7 +1016,7 @@
+ 		}
+ 		else
+ 			strcpy(line, "UNDEFINED       : ");
+-		if ((d->host) && *(d->host))
++		if (*(d->host))
+ 			sprintf(line + strlen(line), "[%s]\n\r", d->host);
+ 		else
+ 			strcat(line, "[Hostname unknown]\n\r");

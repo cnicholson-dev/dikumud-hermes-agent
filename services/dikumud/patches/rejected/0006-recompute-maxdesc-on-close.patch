@@ -1,0 +1,43 @@
+diff -ruN ref/comm.c work/comm.c
+--- ref/comm.c	2026-08-20 10:55:43.299270025 -0400
++++ work/comm.c	2026-08-20 10:56:02.355299424 -0400
+@@ -62,6 +62,7 @@
+ int no_specials = 0; /* Suppress ass. of special routines */
+ 
+ int maxdesc, avail_descs;
++int mother_desc = -1; /* the listening socket; floor for maxdesc */
+ int tics = 0;        /* for extern checkpointing */
+ 
+ int get_from_q(struct txt_q *queue, char *dest);
+@@ -254,6 +255,7 @@
+ 	gettimeofday(&last_time, (struct timeval *) 0);
+ 
+ 	maxdesc = s;
++	mother_desc = s;
+ 	avail_descs = getdtablesize() - 2; /* !! Change if more needed !! */
+ 
+ 	mask = sigmask(SIGUSR1) | sigmask(SIGUSR2) | sigmask(SIGINT) |
+@@ -900,8 +902,22 @@
+ 
+ 	close(d->descriptor);
+ 	flush_queues(d);
++	/*
++	*  Recompute the select() bound instead of assuming the descriptor being
++	*  closed is the highest one. The original "--maxdesc" walks the bound
++	*  down one step per close, and once it drops below the listening socket
++	*  the server silently stops accepting connections for good.
++	*  d is still linked into descriptor_list here, so skip it.
++	*/
+ 	if (d->descriptor == maxdesc)
+-		--maxdesc;
++	{
++		struct descriptor_data *p;
++
++		maxdesc = mother_desc;
++		for (p = descriptor_list; p; p = p->next)
++			if (p != d && p->descriptor > maxdesc)
++				maxdesc = p->descriptor;
++	}
+ 
+ 	/* Forget snooping */
+ 	if (d->snoop.snooping)

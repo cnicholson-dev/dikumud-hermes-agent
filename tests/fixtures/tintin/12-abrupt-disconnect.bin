@@ -1,0 +1,19 @@
+[24;1H[?1000l[?1002l[?1006l[?1016l[?1004h=[>4;1m[?1049l[?7787l[r[24;1H[0m#TRYING TO CONNECT 'diku' TO 'dikumud-p1' PORT '4000'.[0m
+=[?1049l[?7787l[r[24;1H[0m
+[0m#SESSION 'diku' CONNECTED TO 'dikumud-p1' PORT '4000'[0m
+[0m#OK:   1 CONFIG LOADED.[0m
+
+
+                             DikuMUD I (GAMMA 0.0)
+
+                               Created by
+                   Hans Henrik Staerfeldt, Katja Nyboe,
+            Tom Madsen, Michael Seifert, and Sebastian Hammer
+
+By what name do you wish to be known? Wren
+Password: <redacted>
+Reconnecting.
+
+> 
+[0m#SESSION 'diku' DIED.[0m
+=[?1049l[?7787l[r[24;1H[0m#SESSION 'gts' ACTIVATED.[0m

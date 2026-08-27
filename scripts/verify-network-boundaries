@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# SEC-06 to SEC-09 against the running stack, from inside the containers.
+#
+# The effective graph, not the intended one. Phase 7 found two gaps that a
+# reading of compose.yaml would never show: a listener on 0.0.0.0 answering on
+# every attached network, and an "internal: false" network being a NAT route to
+# anywhere rather than to one destination. Both were found by connecting.
+#
+# No root required. Exits non-zero if any check fails, so it can gate a deploy.
+#
+#   scripts/verify-network-boundaries
+
+set -uo pipefail
+
+PASS=0
+FAIL=0
+
+# Runs a TCP connect inside a service and compares the result to what the
+# security model requires. Uses an IP literal or a name as given; a name that
+# does not resolve counts as blocked, which is itself the control on the
+# networks where DNS is scoped.
+#
+# The probe has to work in every image, and they do not carry the same tools:
+# the Python services have python3, while dikumud is a slim Debian image
+# holding a 1991 C binary and a shell. Trying python3 first and falling back to
+# bash's /dev/tcp covers both without installing anything into a runtime image
+# to make testing easier, which would widen the very surface under test.
+probe() {
+  local service="$1" host="$2" port="$3" out
+  out=$(docker compose exec -T "$service" python3 -c "
+import socket
+try:
+    s = socket.create_connection(('$host', $port), 4); s.close(); print('reachable')
+except Exception:
+    print('blocked')
+" 2>/dev/null | tr -d '\r')
+  # Only a clean verdict counts. A missing interpreter reports through stdout
+  # as an OCI error, so testing for non-empty output would accept that as a
+  # result and never reach the fallback.
+  if [ "$out" = "reachable" ] || [ "$out" = "blocked" ]; then
+    echo "$out"
+    return
+  fi
+  docker compose exec -T "$service" bash -c \
+    "timeout 4 bash -c 'exec 3<>/dev/tcp/$host/$port' 2>/dev/null && echo reachable || echo blocked" \
+    2>/dev/null | tr -d '\r'
+}
+
+check() {
+  local service="$1" host="$2" port="$3" expect="$4" why="$5"
+  local got
+  got=$(probe "$service" "$host" "$port")
+
+  if [ "$got" = "$expect" ]; then
+    printf '  PASS  %-16s -> %-22s %-9s  %s\n' "$service" "$host:$port" "$got" "$why"
+    PASS=$((PASS + 1))
+  else
+    printf '  FAIL  %-16s -> %-22s %-9s  expected %s (%s)\n' \
+      "$service" "$host:$port" "${got:-no-output}" "$expect" "$why"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "SEC-06  the agent has no route out and cannot reach the game"
+check hermes-player mud-control 8765 reachable "MCP, authorized"
+check hermes-player mud-control 8766 reachable "learning, authorized"
+check hermes-player openrouter-relay 8080 reachable "inference, authorized"
+check hermes-player dikumud 4000 blocked "no shared network with the game"
+check hermes-player 1.1.1.1 443 blocked "no egress"
+check hermes-player 8.8.8.8 53 blocked "no DNS off-network"
+
+echo
+echo "SEC-07  the relay reaches the upstream and nothing else"
+check openrouter-relay openrouter.ai 443 reachable "the fixed upstream"
+check openrouter-relay 1.1.1.1 443 blocked "host firewall policy"
+check openrouter-relay 8.8.8.8 53 blocked "DNS is via the embedded resolver"
+check openrouter-relay example.com 80 blocked "host firewall policy"
+
+echo
+echo "SEC-08  no unauthorized peer connection"
+check dikumud mud-control 8765 blocked "the game must not reach the boundary"
+check dikumud mud-control 8766 blocked "nor the learning store"
+check mud-control openrouter-relay 8080 blocked "no shared network"
+check mud-control 1.1.1.1 443 blocked "no egress"
+check openrouter-relay dikumud 4000 blocked "no shared network"
+check mud-control dikumud 4000 reachable "the game link, authorized"
+
+echo
+echo "SEC-09  no service can read another's volume"
+# /etc/openrouter-relay is the relay's model policy. The agent must not be able
+# to read it, for the same reason /v1/models advertises one model: the set is
+# the operator's, not the agent's to know.
+for probe in "hermes-player /var/lib/mud-control/learning" \
+             "hermes-player /var/log/mud-control" \
+             "hermes-player /var/lib/dikumud/data" \
+             "hermes-player /etc/openrouter-relay" \
+             "mud-control /opt/data" \
+             "mud-control /var/lib/dikumud/data"; do
+  set -- $probe
+  if docker compose exec -T "$1" sh -c "[ -e '$2' ]" 2>/dev/null; then
+    printf '  FAIL  %-16s can see %s\n' "$1" "$2"
+    FAIL=$((FAIL + 1))
+  else
+    printf '  PASS  %-16s cannot see %s\n' "$1" "$2"
+    PASS=$((PASS + 1))
+  fi
+done
+
+echo
+echo "----------------------------------------------------------------"
+printf 'passed %d, failed %d\n' "$PASS" "$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  echo "The effective network graph does not match the security model."
+  echo "If SEC-07 rows failed, the host rules are probably absent:"
+  echo "    sudo scripts/restrict-relay-egress apply"
+  exit 1
+fi
+echo "The effective graph matches SECURITY.md section 5."

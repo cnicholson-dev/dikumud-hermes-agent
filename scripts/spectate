@@ -1,0 +1,880 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+"""Watch the agent play, and watch it think.
+
+Design section 10 lists what a spectator should see: live cleaned game output,
+the latest stated intent, the command that was sent, connection and prompt
+state, the combined agent-character sheet, memory and skill changes, session
+duration and turn count, OpenRouter request/token/latency metrics, and the stop
+reason. This renders that list, and one thing beyond it.
+
+The addition is the reasoning panel at the bottom left, with an indicator that
+pulses while a model call is open. Section 10 excluded chain-of-thought and
+that exclusion has been lifted deliberately: the relay no longer suppresses
+reasoning, it writes the deltas to a file as they arrive, and this reads them.
+The panel fills while the model is still working rather than after it answers,
+which is the whole reason the relay's upstream call is streamed.
+
+The indicator is not decoration. The median call against these models measured
+48.8 seconds, and for all of that time nothing else on this screen changes; a
+watcher without it cannot tell a thinking agent from a dead one.
+
+The game's own output was missing from it until it was noticed in use, because
+nothing carried it: the audit record holds reasons and lengths rather than
+content, and the cleaned text otherwise lived only in the transport's buffer,
+whose one route out is the destructive `mud_observe`. mud-control now writes a
+bounded feed beside the audit record (`playlog.py`) and this reads it with the
+same `tail`.
+
+Layout follows the window rather than a flag. A terminal wide enough for the
+panels and a readable feed beside them gets two columns, the panels on the left
+at their usual width and the game scrolling on the right; a narrower one gets
+the panels alone, which is what this always showed.
+
+What it will not show, per `SECURITY.md` section 8: credentials, the raw
+environment, or private framework state. That is not a filter applied here; it
+is a property of the sources. The transport redacts the credential before an
+observation is buffered and before the feed is written, the relay's metrics
+endpoint exports counts rather than content, and the audit record refuses a
+reasoning field by name and still does. A spectator that had to strip secrets
+would be the wrong design: it would mean something upstream was still
+producing them.
+
+The reasoning feed changes none of that. It carries no credential because the
+relay never sees one: the game password is injected into mud-control and
+redacted from observations, so it is not in the model's context and the model
+cannot think about it. And it is read from a file inside the relay rather than
+from an endpoint, deliberately. This script reads `/metrics` from inside
+`hermes-player`, so anything the relay served over HTTP would be readable by
+the agent too, and reasoning handed back to the player is not a spectator
+surface, it is a change to what the agent knows.
+
+Two boundaries the panel does not move: the audit record stays free of
+reasoning, so `--transcript` and the captured transcript remain publishable
+without review, and the reply the agent receives is still stripped of it.
+
+It is a terminal renderer rather than a served view on purpose. A page needs a
+service, a port, a volume mount for the audit record, and a listening socket
+bound to 127.0.0.1 that has to be kept bound to 127.0.0.1. A terminal needs
+none of those, and the demonstration is a recording either way.
+
+    scripts/spectate            # follow, refreshing as events arrive
+    scripts/spectate --once     # one frame, for a screenshot or a report
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import signal
+import textwrap
+import subprocess
+import sys
+import threading
+import time
+
+AUDIT = "/var/log/mud-control/audit.jsonl"
+LEARNING = "/var/lib/mud-control/learning"
+PLAY = "/var/log/mud-control/play.log"
+#: The model's own reasoning, written by the relay as the deltas arrive. Read
+#: from that container rather than served by it: this script reads /metrics
+#: from inside hermes-player, so anything the relay served over HTTP would be
+#: readable by the agent as well, and reasoning handed back to the player is
+#: not a spectator surface, it is a context change.
+REASONING = "/tmp/reasoning.log"
+
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def compose(*args: str, service: str = "mud-control") -> str:
+    """Run a command in a service and return stdout, or "" if it failed."""
+    try:
+        done = subprocess.run(
+            ["docker", "compose", "exec", "-T", service, *args],
+            capture_output=True, text=True, timeout=15, check=False)
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return ""
+    return done.stdout if done.returncode == 0 else ""
+
+
+def audit_events(limit: int = 400) -> list[dict]:
+    raw = compose("sh", "-c", f"tail -n {limit} {AUDIT}")
+    events = []
+    for line in raw.splitlines():
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def learning(character: str) -> tuple[list[dict], list[dict]]:
+    raw = compose("sh", "-c", f"""
+        for f in facts procedures; do
+            cat {LEARNING}/{character}/$f.json 2>/dev/null || echo 'null'
+        done
+    """)
+    parts = raw.strip().split("\n{")
+    try:
+        facts = json.loads(parts[0]) if parts and parts[0] != "null" else None
+        rest = "{" + parts[1] if len(parts) > 1 else "null"
+        procedures = json.loads(rest) if rest != "null" else None
+    except (json.JSONDecodeError, IndexError):
+        return [], []
+    return ((facts or {}).get("facts", []),
+            (procedures or {}).get("procedures", []))
+
+
+def play_feed(limit: int = 8192) -> str:
+    """The game's own output, as mud-control cleaned it.
+
+    A tail rather than a stream: the file is bounded and rotated by the
+    service, and a spectator only ever shows the last screenful anyway.
+    """
+    return compose("sh", "-c", f"tail -c {limit} {PLAY} 2>/dev/null")
+
+
+def reasoning_feed(limit: int = 6144) -> str:
+    """What the model is thinking, as the relay wrote it.
+
+    A tail, like the play feed, and for the same reason: the file is bounded
+    and rotated by the service, and a panel only ever shows the last screenful.
+    Larger than the play tail because reasoning outruns game text by roughly
+    ten to one and a screenful of it is more characters.
+    """
+    return compose("sh", "-c", f"tail -c {limit} {REASONING} 2>/dev/null",
+                   service="openrouter-relay")
+
+
+def current_thought(feed: str) -> str:
+    """The most recent call's reasoning alone.
+
+    The feed holds every call the relay has served. Showing all of it would
+    have the panel scroll through the last twenty turns of thinking, so this
+    takes the text after the last call marker. Between calls that is the last
+    completed call, which is deliberate: a watcher reading why the agent did
+    what it just did should not have the panel blank the moment it stops
+    thinking.
+    """
+    marker = feed.rfind("--- call ")
+    if marker == -1:
+        return feed
+    line_end = feed.find("\n", marker)
+    return feed[line_end + 1:] if line_end != -1 else ""
+
+
+def relay_metrics() -> dict:
+    raw = compose("python3", "-c",
+                  "import urllib.request;"
+                  "print(urllib.request.urlopen("
+                  "'http://openrouter-relay:8080/metrics', timeout=5)"
+                  ".read().decode())",
+                  service="hermes-player")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+
+def character_name() -> str:
+    raw = compose("sh", "-c", "printenv MUD_CONTROL_CHARACTER")
+    return raw.strip() or "unknown"
+
+
+def rule(title: str, width: int) -> str:
+    return f"{DIM}-- {title} {'-' * max(0, width - len(title) - 4)}{RESET}"
+
+
+#: Codes the frame paints with. Stripped when measuring, because a padded
+#: column has to be padded by what is visible rather than by what is written.
+ANSI = re.compile(r"\033\[[0-9;?]*[a-zA-Z]")
+
+
+def visible_len(text: str) -> int:
+    return len(ANSI.sub("", text))
+
+
+def feed_lines(feed: str, width: int, height: int) -> list[str]:
+    """The game's output, wrapped into the right-hand column.
+
+    Newest at the bottom, the way a terminal session reads. Blank lines are
+    kept: DikuMUD separates a room description from its exits with one, and a
+    feed with them collapsed is much harder to follow.
+    """
+    out: list[str] = []
+    for line in feed.replace("\r", "").split("\n"):
+        if not line.strip():
+            out.append("")
+            continue
+        out.extend(textwrap.wrap(line, width) or [""])
+    return out[-height:]
+
+
+def side_by_side(left: list[str], right: list[str], left_width: int,
+                 gap: int = 3) -> list[str]:
+    """Lay two columns side by side, left padded to a fixed width."""
+    rows = max(len(left), len(right))
+    out: list[str] = []
+    for index in range(rows):
+        cell = left[index] if index < len(left) else ""
+        pad = " " * max(0, left_width - visible_len(cell))
+        beside = right[index] if index < len(right) else ""
+        out.append(f"{cell}{pad}{' ' * gap}{beside}".rstrip())
+    return out
+
+
+def clip(text: str, room: int) -> str:
+    """Keep a line inside the frame width.
+
+    Any line that wraps occupies two rows, and the height budget counts lines
+    rather than rows, so one wrapped line is enough to push the frame past the
+    bottom of the window and start it scrolling.
+    """
+    if room <= 0:
+        return ""
+    return text if len(text) <= room else text[:room - 1] + "…"
+
+
+def collect_fast() -> dict:
+    """The two sources that change while a call is open.
+
+    Read on their own faster cadence. The reasoning tail is the thing a
+    watcher is actually reading during a call, and the inference gauge is what
+    lights the indicator, so both at three-second resolution would make the
+    panel feel like a slideshow. They are also the two cheapest reads: measured
+    at 0.10 s and 0.19 s against the live stack, against 0.63 s for a full
+    collect.
+    """
+    return {"metrics": relay_metrics(), "reasoning": reasoning_feed()}
+
+
+def collect() -> dict:
+    """Read every source once.
+
+    Formatting is retried until the frame fits the window; the container reads
+    behind it must not be.
+    """
+    events = audit_events()
+    name = character_name()
+    facts, procedures = learning(name)
+
+    # The session panel and the play log describe THIS session. The audit
+    # record is append-only across every session the stack has ever run, so
+    # reading the whole tail showed a new session the previous one's commands,
+    # the previous one's stop reason, and both sessions' counts added together:
+    # a frame reporting state READY and stopped operator_stop at once.
+    lifecycle = ("session_opened", "session_resumed")
+    start = 0
+    for index, event in enumerate(events):
+        if event.get("event") in lifecycle:
+            start = index
+    current = events[start:]
+    opened = (current[0] if current
+              and current[0].get("event") in lifecycle else None)
+
+    # Every event carries the id of the session it belongs to, so "this
+    # session" is a filter and not only a slice. The scan above finds where the
+    # session began; the id is what says which of the later events are part of
+    # it, which is a different set as soon as anything else writes in between.
+    # It is also the name a capture is filed under, so two scripts looking at
+    # one session agree on which one it is.
+    session_id = (opened or {}).get("session_id", "")
+    if session_id:
+        current = [e for e in current if e.get("session_id") == session_id]
+
+    # Mutations only. "learning_loaded" is startup noise, and the fault events
+    # describe the store's health rather than a change the agent made; showing
+    # one as "last change" reports a stale quarantine from hours ago as though
+    # the agent had just done something.
+    mutations = ("learning_fact_added", "learning_fact_removed",
+                 "learning_procedure_saved", "learning_procedure_removed",
+                 "learning_rejected")
+
+    return {
+        "name": name,
+        "facts": facts,
+        "procedures": procedures,
+        **collect_fast(),
+        "feed": play_feed(),
+        "opened": opened,
+        # The last thing this session did, whatever it was. The activity line
+        # names a state from it when no model call is open, which is the only
+        # part of that line the audit record can answer: an observation writes
+        # no event, so "waiting" is an inference and "thinking" is not.
+        "last_event": current[-1] if current else None,
+        "session_id": session_id,
+        "ended": any(e.get("event") in ("session_stopped", "session_closed")
+                     for e in current),
+        "events": current,
+        "commands": [e for e in current if e.get("event") == "command_sent"],
+        "rejected": [e for e in current
+                     if e.get("event") == "command_rejected"],
+        "stopped": [e for e in current if e.get("event") == "session_stopped"],
+        # Store health is a property of the store, not of one session.
+        "learned": [e for e in events if e.get("event") in mutations],
+        "quarantined": any(e.get("event") == "learning_quarantined"
+                           for e in events[-40:]),
+    }
+
+
+def render(data: dict, width: int, max_play: int = 8,
+           max_facts: int = 4) -> list[str]:
+    name = data["name"]
+    facts, procedures = data["facts"], data["procedures"]
+    metrics = data["metrics"]
+    commands, rejected = data["commands"], data["rejected"]
+    stopped, opened, learned = data["stopped"], data["opened"], data["learned"]
+    quarantined = data["quarantined"]
+
+    out: list[str] = []
+    add = out.append
+
+    add(f"{BOLD}{name}{RESET}{DIM}  a supervised DikuMUD session{RESET}")
+    add("")
+
+    # -- what just happened ------------------------------------------
+    add(rule("play", width))
+    if not commands:
+        add(f"  {DIM}no commands yet{RESET}")
+    for event in (commands[-max_play:] if max_play else []):
+        when = time.strftime("%H:%M:%S", time.localtime(event.get("ts", 0)))
+        command = str(event.get("command", ""))[:24]
+        # 36 columns of timestamp, padding and command before the intent.
+        intent = clip(str(event.get("intent", "")), width - 36)
+        add(f"  {DIM}{when}{RESET}  {BOLD}{command:<24}{RESET}{intent}")
+    if rejected:
+        last = rejected[-1]
+        detail = f" - {last.get('detail')}" if last.get("detail") else ""
+        summary = f"last refusal: {last.get('reason', '')}{detail}"
+        add(f"  {DIM}{clip(summary, width - 2)}{RESET}")
+    add("")
+
+    # -- where the session stands ------------------------------------
+    add(rule("session", width))
+    if opened:
+        add(f"  state       {opened.get('turn_state', 'unknown')}"
+            f"{DIM}  prompt {opened.get('prompt', '-')}{RESET}")
+        started = opened.get("ts", 0)
+        if started:
+            minutes = (time.time() - started) / 60
+            add(f"  duration    {minutes:.0f} min{DIM}  since this session"
+                f" opened{RESET}")
+    add(f"  commands    {len(commands)}{DIM}  refused {len(rejected)}{RESET}")
+    if stopped:
+        reason = stopped[-1].get("reason", "unknown")
+        add(f"  {BOLD}stopped     {reason}{RESET}")
+    else:
+        add(f"  stopped     {DIM}not stopped{RESET}")
+    add("")
+
+    # -- what it has learned -----------------------------------------
+    add(rule(f"learning  {len(facts)} facts, {len(procedures)} procedures",
+             width))
+    for fact in (facts[-max_facts:] if max_facts else []):
+        tags = ",".join(fact.get("tags", []))
+        text = clip(fact.get("text", ""),
+                    width - 6 - (len(tags) + 3 if tags else 0))
+        add(f"  {text}{DIM}{'  [' + tags + ']' if tags else ''}{RESET}")
+    for procedure in procedures:
+        title = clip(str(procedure.get("title", "")), width - 13)
+        add(f"  {DIM}procedure:{RESET} {title}")
+    if learned:
+        last = learned[-1]
+        what = str(last.get("event", "")).replace("learning_", "")
+        detail = last.get("reason") or last.get("id") or last.get("name") or ""
+        summary = f"last change: {what}{' ' + str(detail) if detail else ''}"
+        add(f"  {DIM}{clip(summary, width - 2)}{RESET}")
+    if quarantined:
+        warning = ("store quarantined: learning is unavailable until an "
+                   "operator resolves it")
+        add(f"  {BOLD}{clip(warning, width - 2)}{RESET}")
+    add("")
+
+    # -- what it cost -------------------------------------------------
+    add(rule("model", width))
+    budgets = metrics.get("budgets", {})
+    latency = metrics.get("latency_ms", {})
+    if budgets:
+        add(f"  requests    {budgets.get('requests_total', 0)}"
+            f"{DIM}  ok {budgets.get('requests_ok', 0)}"
+            f"  refused {budgets.get('requests_refused', 0)}"
+            f"  remaining {budgets.get('requests_remaining', '-')}{RESET}")
+        add(f"  tokens      {budgets.get('prompt_tokens', 0)} in"
+            f"  {budgets.get('completion_tokens', 0)} out")
+    if latency.get("count"):
+        add(f"  latency     p50 {latency.get('p50', 0):.0f} ms"
+            f"{DIM}  p95 {latency.get('p95', 0):.0f} ms"
+            f"  max {latency.get('max', 0):.0f} ms{RESET}")
+    models = metrics.get("models") or {}
+    if models.get("last"):
+        # Which model actually answered. The relay moves down its configured
+        # order when a model is unavailable, and the whole point of showing this
+        # is that "which model played" never becomes a guess.
+        short = models["last"].split("/")[-1]
+        line = f"  model       {short}"
+        if models.get("fallbacks"):
+            line += (f"{DIM}  fell back {models['fallbacks']}x from the "
+                     f"primary{RESET}")
+        add(line)
+
+    rate = metrics.get("rate") or {}
+    if rate.get("waits"):
+        # A throttled session and a slow model look identical from here
+        # otherwise, and they call for different responses: one is the free
+        # tier's ceiling, the other is the model.
+        add(f"  paced       waited {rate.get('seconds', 0)}s over "
+            f"{rate['waits']} requests{DIM}  free-tier ceiling{RESET}")
+
+    if not budgets and not latency.get("count"):
+        add(f"  {DIM}no model calls recorded yet{RESET}")
+
+    return out
+
+
+#: The indicator. Geometric shapes rather than emoji, and `clip` already emits
+#: U+2026, so UTF-8 output is an assumption this frame has always made.
+LIT = "●"
+DARK = "·"
+#: Two phases of 0.8 seconds. Slow enough to read as a pulse rather than a
+#: strobe, and it costs one small write about every 0.8 s while a call is open
+#: and nothing at all while it is not. That second half matters: the recording
+#: pipeline turns every write into a frame, so an indicator that repainted
+#: while idle would make each captured GIF enormous for no information.
+PULSE_PERIOD = 1.6
+#: Where the pulse writes. The status line is indented by two like every other
+#: panel body, so the icon lands in column 3, and the segment is a fixed width
+#: so a repaint of it cannot disturb what sits to its right.
+STATUS_COL = 3
+STATUS_WIDTH = 30
+#: Below this the panel is a sliver rather than a view, and the rows are worth
+#: more to the panels above it.
+MIN_REASONING_ROWS = 4
+
+
+def activity(data: dict, age: float = 0.0) -> tuple[str, float, bool]:
+    """What the agent is doing, for how long, and whether that pulses.
+
+    Only one of these states is measured rather than inferred. `thinking` comes
+    from the relay's in-flight gauge, which knows a call is open because it
+    opened it. The rest are read from the last audited event, which is the best
+    the audit record can do: an observation writes no event, so a session that
+    is waiting for the game and a session that is idle look identical from
+    here. That is why the indicator is wired to the gauge and not to the audit.
+
+    `age` is the seconds since the snapshot was taken. Adding it lets the
+    counter advance smoothly between polls instead of jumping by the interval,
+    which for a call whose median is 48.8 seconds is most of what makes the
+    panel feel alive rather than stuck.
+    """
+    inference = (data.get("metrics") or {}).get("inference") or {}
+    if inference.get("in_flight"):
+        return "thinking", float(inference.get("seconds") or 0.0) + age, True
+
+    last = data.get("last_event") or {}
+    since = (time.time() - last["ts"]) if last.get("ts") else 0.0
+
+    if data.get("stopped"):
+        return "stopped", since, False
+    if not data.get("opened"):
+        return "idle", 0.0, False
+    kind = last.get("event", "")
+    if kind == "command_sent":
+        return "acting", since, False
+    if kind == "command_rejected":
+        return "refused", since, False
+    return "waiting", since, False
+
+
+def status_segment(label: str, seconds: float, pulsing: bool,
+                   bright: bool = True) -> str:
+    """The icon and the state, as one fixed-width cell.
+
+    The pulse is a brightness change on the icon rather than the terminal's
+    blink attribute. `agg` renders the asciicast into the published GIF from
+    the writes it sees, and a blink attribute is a rendering state it does not
+    animate: the recording would show a permanently lit dot.
+    """
+    icon = LIT if pulsing else DARK
+    style = (BOLD if bright else DIM) if pulsing else DIM
+    clock = f", {seconds:.0f}s" if seconds >= 1 else ""
+    return f"{style}{icon}{RESET}  {label}{clock}"
+
+
+def reasoning_panel(data: dict, width: int, rows: int,
+                    age: float = 0.0, bright: bool = True) -> list[str]:
+    """What the model is thinking, and whether it is thinking right now.
+
+    The content is the reasoning the relay streamed while the call was open,
+    which is why it fills as the model works rather than arriving with the
+    answer. What sits here between calls is the last call's thinking, so the
+    panel still answers "why did it just do that".
+    """
+    out = ["", rule("reasoning", width)]
+
+    label, seconds, pulsing = activity(data, age)
+    segment = status_segment(label, seconds, pulsing, bright)
+    pad = " " * max(0, STATUS_WIDTH - visible_len(segment))
+
+    commands = data.get("commands") or []
+    beside = ""
+    if commands:
+        last = commands[-1]
+        when = time.strftime("%H:%M:%S", time.localtime(last.get("ts", 0)))
+        beside = clip(f"last sent {last.get('command', '')} at {when}",
+                      width - STATUS_COL - STATUS_WIDTH - 2)
+    out.append(f"  {segment}{pad}{DIM}{beside}{RESET}")
+
+    body = rows - len(out)
+    if body > 0:
+        thought = current_thought(data.get("reasoning", ""))
+        lines: list[str] = []
+        for paragraph in thought.replace("\r", "").split("\n"):
+            if not paragraph.strip():
+                lines.append("")
+                continue
+            lines.extend(textwrap.wrap(paragraph, width - 2) or [""])
+        if not any(line.strip() for line in lines):
+            lines = [f"{DIM}nothing yet; the panel fills as the model thinks"
+                     f"{RESET}"]
+        # Newest last, so a call that outgrows the panel scrolls the way a
+        # terminal does and the most recent thought stays visible.
+        lines = lines[-body:]
+        # Padded to exactly the rows it was given. The caller has already
+        # decided the frame is `height` lines and a panel that came up short
+        # would leave the frame shorter than the window, which is harmless on
+        # its own but breaks the row arithmetic the pulse writes to.
+        lines += [""] * (body - len(lines))
+        out.extend(f"  {line}".rstrip() for line in lines)
+    return out[:rows] if rows > 0 else []
+
+
+def transcript(data: dict) -> list[str]:
+    """The session read back as one line per thing that happened.
+
+    One line per thing that happened, in a fixed format, so a generated
+    transcript and a hand-made one are the same kind of artefact:
+
+        15:34:52  session    opened game
+        15:35:37  mud_act    look board       | Checking the bulletin board
+
+    Refusals are included, which the hand-made file does not show. A session
+    that refused nineteen commands and a session that refused none are not the
+    same session, and a transcript that hides that is flattering rather than
+    accurate. Everything here comes from the audit record, so it carries
+    reasons and commands rather than content: no game text, no reasoning, no
+    credential.
+    """
+    out: list[str] = []
+    for event in data.get("events", []):
+        when = time.strftime("%H:%M:%S", time.localtime(event.get("ts", 0)))
+        kind = event.get("event", "")
+        if kind == "command_sent":
+            command = str(event.get("command", ""))
+            out.append(f"{when}  {'mud_act':<7}    {command:<16} | "
+                       f"{event.get('intent', '')}")
+        elif kind == "command_rejected":
+            reason = str(event.get("reason", ""))
+            detail = event.get("detail")
+            out.append(f"{when}  {'refused':<7}    {reason:<16} | {detail}"
+                       if detail else
+                       f"{when}  {'refused':<7}    {reason}")
+        elif kind == "session_opened":
+            out.append(f"{when}  {'session':<7}    opened "
+                       f"{event.get('prompt', '')}".rstrip())
+        elif kind == "session_resumed":
+            out.append(f"{when}  {'session':<7}    resumed "
+                       f"{event.get('turn_state', '')}".rstrip())
+        elif kind == "session_stopped":
+            out.append(f"{when}  {'session':<7}    stopped "
+                       f"{event.get('reason', '')}".rstrip())
+        elif kind == "session_closed":
+            out.append(f"{when}  {'session':<7}    closed")
+    return out
+
+
+class Collector:
+    """Reads the sources on two cadences, off the painting thread.
+
+    A full collect measured 0.62 to 0.65 seconds against the live stack, five
+    `docker compose exec` calls deep. Doing that on the paint thread would
+    freeze the indicator for most of a pulse phase every time it ran, which is
+    exactly the interval the pulse exists to fill. So it runs here and the
+    paint thread only ever reads the latest snapshot.
+
+    The fast pass covers the reasoning tail and the inference gauge, the two
+    things that change while a call is open. Everything else keeps the interval
+    it always had.
+    """
+
+    def __init__(self, interval: float, fast_interval: float = 1.0) -> None:
+        self._interval = interval
+        self._fast = min(fast_interval, interval)
+        self._lock = threading.Lock()
+        self._data: dict = {}
+        self._stamp = 0.0
+        #: Bumped on every update. The paint thread repaints when this changes
+        #: rather than on a timer, so a frame is only written when there is
+        #: something new in it.
+        self._version = 0
+        self._stop = threading.Event()
+
+    def start(self) -> dict:
+        """Take the first snapshot on this thread, then keep going on another.
+
+        Synchronous first, so the opening frame is a real one rather than an
+        empty panel that fills a moment later.
+        """
+        self._data = collect()
+        self._stamp = time.monotonic()
+        self._version = 1
+        threading.Thread(target=self._run, daemon=True).start()
+        return self._data
+
+    def _run(self) -> None:
+        next_slow = time.monotonic() + self._interval
+        while not self._stop.wait(self._fast):
+            now = time.monotonic()
+            slow = now >= next_slow
+            update = collect() if slow else collect_fast()
+            if slow:
+                next_slow = time.monotonic() + self._interval
+            with self._lock:
+                self._data = {**self._data, **update}
+                self._stamp = time.monotonic()
+                self._version += 1
+
+    def snapshot(self) -> tuple[dict, float, int]:
+        with self._lock:
+            return self._data, self._stamp, self._version
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def client_running() -> bool:
+    """Whether a `hermes chat` process is alive in the agent container.
+
+    The same check scripts/2.start-agent and scripts/lib/session.sh make. It is
+    here because a session can end at the client rather than at the boundary.
+    """
+    return bool(compose("pgrep", "-f", "hermes chat",
+                        service="hermes-player").strip())
+
+
+def session_over(data: dict, started_at: float, initial_id: str,
+                 grace: float = 15.0) -> bool:
+    """True when there is nothing left to watch.
+
+    Two endings, and only watching for one of them would hang. A run that
+    spends its own turn budget stops the client and never signals the boundary,
+    so no stop event is ever written; a run ended by scripts/3.stop-stack
+    records the event first and the client goes away after. So either is
+    enough.
+
+    Both signals are stale at the moment a spectator starts, and in opposite
+    directions. The audit record still describes the PREVIOUS session until the
+    agent calls mud_connect, which is a minute into a run, so a previous
+    session's stop event would end the recording at the first frame: an ended
+    session only counts once its id is one that appeared after this spectator
+    did. And the client takes a few seconds to exist at all, so that check is
+    suppressed until it has had time to.
+    """
+    if data.get("ended") and data.get("session_id", "") != initial_id:
+        return True
+    if time.monotonic() - started_at < grace:
+        return False
+    return not client_running()
+
+
+def fit(data: dict, width: int, height: int) -> list[str]:
+    """Format the frame so it cannot be taller than the window.
+
+    A frame that overflows scrolls, and a scrolled frame cannot be repainted in
+    place: the next cursor-home lands in a viewport that no longer starts where
+    the frame did, so the top of it, the play log, is pushed into scrollback
+    and what remains tears a little more on every tick. The sections that carry
+    list shrink instead, newest entries kept, and only a window too short to
+    hold even the fixed lines gets a truncation marker.
+    """
+    max_play, max_facts = 8, 4
+    while True:
+        lines = render(data, width, max_play, max_facts)
+        if len(lines) <= height:
+            return lines
+        if max_play > 1:
+            max_play -= 1
+        elif max_facts > 0:
+            max_facts -= 1
+        else:
+            hidden = len(lines) - height + 1
+            marker = f"… {hidden} more lines, the window is too short"
+            return lines[:height - 1] + [f"{DIM}{marker}{RESET}"]
+
+
+#: The panels keep the width they have always had. The feed takes what is left.
+LEFT_WIDTH = 100
+GAP = 3
+#: Below this the feed is too narrow to read a room description in, so the
+#: window gets the single column instead of two cramped ones.
+MIN_FEED = 40
+
+
+def frame(data: dict, width: int, height: int | None,
+          age: float = 0.0, bright: bool = True) -> list[str]:
+    """One frame laid out for the window it is going into.
+
+    Not a second mode: the panels are identical either way, and a window with
+    room beside them gets the game's own output there rather than nothing.
+    `height` is None for `--once`, which is a report rather than a view and is
+    not truncated to fit anything.
+
+    The reasoning panel is anchored to the bottom and takes whatever rows the
+    panels above it did not need. That is why `fit` is asked to fit a shorter
+    window: the panels shrink first, the reasoning gets the remainder, and the
+    left column comes out exactly `height` lines so nothing scrolls.
+    """
+    return layout(data, width, height, age, bright)[0]
+
+
+def layout(data: dict, width: int, height: int | None, age: float = 0.0,
+           bright: bool = True) -> tuple[list[str], int]:
+    """The frame, and the 1-indexed row its status line landed on.
+
+    The row is returned rather than derived from the height because the panel
+    starts wherever the panels above it stopped, which changes with the window,
+    the number of commands and the number of facts. The paint loop caches it
+    from the last full repaint and writes the pulse there, so a pulse never has
+    to search the frame for its own icon.
+    """
+    left_width = min(width, LEFT_WIDTH)
+    if height is None:
+        # A report. Everything at its natural length, the panel appended with
+        # room for a readable amount of thinking rather than a fitted amount.
+        panels = render(data, left_width)
+        panel = reasoning_panel(data, left_width, MIN_REASONING_ROWS + 8,
+                                age, bright)
+    else:
+        # The panels shrink first, bounded so the reasoning always has room,
+        # and the reasoning takes every row they did not use.
+        panels = fit(data, left_width, max(1, height - MIN_REASONING_ROWS))
+        panel = reasoning_panel(data, left_width, height - len(panels),
+                                age, bright)
+    # Three fixed lines open the panel: a blank spacer, the rule, the status.
+    row = len(panels) + 3
+    left = panels + panel
+
+    if width < LEFT_WIDTH + GAP + MIN_FEED:
+        return left, row
+    rows = height if height is not None else len(left)
+    right = feed_lines(data.get("feed", ""), width - LEFT_WIDTH - GAP, rows)
+    return side_by_side(left, right, LEFT_WIDTH, GAP), row
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--once", action="store_true",
+                        help="render one frame and exit")
+    parser.add_argument("--transcript", action="store_true",
+                        help="print this session as one line per event, from "
+                             "the audit record, and exit")
+    parser.add_argument("--until-stopped", action="store_true",
+                        help="exit after a final frame once the session has "
+                             "ended, so a recording finishes by itself")
+    parser.add_argument("--interval", type=float, default=3.0,
+                        help="seconds between refreshes (default 3)")
+    args = parser.parse_args()
+
+    if args.transcript:
+        print("\n".join(transcript(collect())))
+        return 0
+
+    if args.once:
+        size = shutil.get_terminal_size((100, 40))
+        print("\n".join(frame(collect(), size.columns, None)))
+        return 0
+
+    # The alternate screen buffer, because this is a view rather than output.
+    # Nothing reaches scrollback, the window cannot scroll out from under the
+    # paint, and the shell comes back exactly as it was on Ctrl-C. Skipped when
+    # stdout is not a terminal, so a redirected run still produces plain text.
+    tty = sys.stdout.isatty()
+    if tty:
+        # A signalled exit must restore the terminal too, or a killed spectator
+        # leaves the shell on the alternate screen with no cursor. SystemExit
+        # unwinds through the finally below; the default SIGTERM does not.
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, lambda *_: sys.exit(0))
+        sys.stdout.write("\033[?1049h\033[?25l")
+    started_at = time.monotonic()
+    collector = Collector(args.interval)
+    first = collector.start()
+    # The session the audit record describes right now, which for the first
+    # minute of a run is the previous one. See session_over.
+    initial_id = first.get("session_id", "") if args.until_stopped else ""
+
+    painted_version = -1
+    painted_size = None
+    painted_phase = None
+    status = 0
+    try:
+        while True:
+            # Read every pass: a window resized mid-session should be honoured
+            # rather than remembered from startup.
+            size = shutil.get_terminal_size((100, 40))
+            data, stamp, version = collector.snapshot()
+            age = time.monotonic() - stamp
+            # Phase from the clock rather than from a tick count, so a pass
+            # that took longer than usual does not shift the rhythm.
+            bright = int(time.monotonic() / (PULSE_PERIOD / 2)) % 2 == 0
+            label, seconds, pulsing = activity(data, age)
+
+            if version != painted_version or size != painted_size:
+                lines, status = layout(data, size.columns, size.lines,
+                                       age, bright)
+                # Home, erase each line as it is written, then clear whatever
+                # the last frame left below. A full-screen clear blanks the
+                # window on every tick, which flickers; this overwrites in
+                # place.
+                painted = "\n".join(line + "\033[K" for line in lines)
+                sys.stdout.write(("\033[H" if tty else "") + painted + "\033[J")
+                sys.stdout.flush()
+                painted_version, painted_size, painted_phase = (
+                    version, size, bright)
+                # After the paint, so the frame showing the stop reason is the
+                # last one on screen and the last one in a recording.
+                if args.until_stopped and session_over(data, started_at,
+                                                       initial_id):
+                    return 0
+            elif tty and pulsing and bright != painted_phase:
+                # The pulse, and nothing else. One cursor-addressed write of a
+                # fixed-width cell, which is what keeps an idle spectator from
+                # putting a frame into the recording every tenth of a second:
+                # `agg` turns writes into GIF frames, so a repaint that carried
+                # no news would cost a frame anyway.
+                segment = status_segment(label, seconds, True, bright)
+                pad = " " * max(0, STATUS_WIDTH - visible_len(segment))
+                sys.stdout.write(
+                    f"\033[{status};{STATUS_COL}H{segment}{pad}")
+                sys.stdout.flush()
+                painted_phase = bright
+
+            # Short enough to keep the pulse on time, and it costs nothing:
+            # without new data and without a phase change, a pass writes
+            # nothing at all.
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        collector.stop()
+        if tty:
+            sys.stdout.write("\033[?25h\033[?1049l")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

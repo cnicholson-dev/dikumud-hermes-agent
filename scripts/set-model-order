@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# Choose which of the configured models plays, and in what order.
+#
+#   scripts/set-model-order lightning ultra
+#   scripts/set-model-order --list
+#
+# WHY THIS IS A SCRIPT
+#   Two files have to agree. The relay tries the models in `order`, and the
+#   agent's profile names a model of its own; scripts/1.start-stack refuses to
+#   start the stack when the profile disagrees with the first ordered model,
+#   because a session that quietly asks for a model the relay's catalog does
+#   not advertise is worse than a session that does not start. This writes both
+#   from one input, the same rule scripts/4.load-character follows for the
+#   character name and the credential file.
+#
+#   It also recreates the relay rather than restarting it: the model
+#   configuration is read once at startup, so a restart would keep the old
+#   order.
+#
+# WHAT IT DOES NOT DO
+#   It never adds a model. `order` may only name models already defined in the
+#   file, which are the ones somebody verified against the catalog and ran
+#   scripts/verify-openrouter-tool-calling against. Adding one is
+#   public-documentation/OPERATIONS.md section 12, deliberately by hand.
+#
+#   It does not touch the packaged default inside the image. That copy exists
+#   for the unit tests and a bare `docker run`; the deployment reads the file
+#   this script edits.
+#
+# Exit codes: 0 set or listed, 1 a check failed, 2 usage.
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+#: Mirrors MAX_ORDERED_MODELS in policy.py, which is the authority. Checked
+#: here too so a mistake is refused before anything is written, rather than
+#: after the relay fails to come back up.
+MAX_ORDERED=4
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/set-model-order                     pick from a menu
+       scripts/set-model-order <model> [<model> ...]
+       scripts/set-model-order --list
+
+With no arguments it asks which model should lead, offering one option per
+configured model, and puts the others behind it.
+
+Named directly, it sets the exact order given. Names may be full ids or any
+unique fragment of one, so `lightning`, `ultra` and `super` all work.
+
+The first model named becomes the one the agent's catalog advertises and the
+one every request is rewritten to. Models left out are still configured; they
+just do not play.
+EOF
+  exit 2
+}
+
+fail() { echo "set-model-order: $*" >&2; exit 1; }
+say()  { printf '%-16s %s\n' "$1" "$2"; }
+
+case "${1:-}" in -h|--help) usage ;; esac
+# No arguments is the menu, below, not an error: picking one of a handful of
+# orders is the common case and remembering three model names to type is not.
+if [ $# -eq 0 ] && [ ! -t 0 ]; then
+  echo "set-model-order: no arguments and no terminal to ask on." >&2
+  usage
+fi
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . ./.env
+  set +a
+fi
+CONFIG="${RELAY_MODEL_CONFIG_FILE:-config/relay/models.toml}"
+PROFILE=config/hermes-profile/config.yaml
+
+[ -f "$CONFIG" ] || fail "the relay's model configuration is missing: $CONFIG"
+[ -w "$CONFIG" ] || fail "not writable: $CONFIG"
+
+# -- what the file defines -------------------------------------------------
+defined="$(awk -F'"' '/^\[models\."/ {print $2}' "$CONFIG")"
+[ -n "$defined" ] || fail "$CONFIG defines no models"
+
+current="$(awk '
+  /^order[[:space:]]*=[[:space:]]*\[/ {inside = 1; next}
+  inside && /^\]/                    {inside = 0; next}
+  inside                             {gsub(/[",[:space:]]/, ""); if ($0) print}
+' "$CONFIG")"
+
+#: Everything the file defines, as an array, so the menu can index it.
+models=()
+while IFS= read -r line; do models+=("$line"); done <<EOF
+$defined
+EOF
+
+#: The readable half of an id, for a menu that has to fit on one line.
+short() { local s="${1##*/}"; printf '%s' "${s%:free}"; }
+
+#: Every ordering of the defined models, each as a comma-joined string, in
+#: index order: 123, 132, 213, 231, 312, 321. Three models is six options,
+#: which is a menu; four would be twenty-four, which is not, so past a
+#: threshold the menu falls back to one option per model and the rest are
+#: reachable by naming them.
+PERMUTATION_LIMIT=12
+perms=()
+build_perms() {
+  local prefix="$1"
+  shift
+  local remaining=("$@")
+  if [ "${#remaining[@]}" -eq 0 ]; then
+    perms+=("${prefix#,}")
+    return
+  fi
+  local i j rest
+  for i in "${!remaining[@]}"; do
+    rest=()
+    for j in "${!remaining[@]}"; do
+      [ "$j" = "$i" ] || rest+=("${remaining[$j]}")
+    done
+    build_perms "$prefix,${remaining[$i]}" ${rest[@]+"${rest[@]}"}
+  done
+}
+
+#: The order option N produces, as newline-separated ids.
+option_order() {
+  local pick="$1" id
+  if [ "${#perms[@]}" -gt 0 ]; then
+    printf '%s' "${perms[$((pick - 1))]}" | tr ',' '\n'
+    return
+  fi
+  # Fallback for a set too large to permute: the Nth model leads, the others
+  # follow in the order the file defines them.
+  printf '%s\n' "${models[$((pick - 1))]}"
+  for id in "${models[@]}"; do
+    [ "$id" = "${models[$((pick - 1))]}" ] || printf '%s\n' "$id"
+  done
+}
+
+#: The orders as a single comma-separated line, for comparing and printing.
+one_line() { printf '%s' "$1" | tr '\n' ',' | sed 's/,$//'; }
+
+if [ $# -eq 0 ]; then
+  # Permute when the result is small enough to read; one option per model
+  # otherwise. factorial(n) grows fast enough that the guard earns its keep at
+  # four models.
+  factorial=1
+  for n in $(seq 1 "${#models[@]}"); do factorial=$((factorial * n)); done
+  if [ "$factorial" -le "$PERMUTATION_LIMIT" ]; then
+    build_perms "" "${models[@]}"
+    choices=${#perms[@]}
+  else
+    choices=${#models[@]}
+  fi
+
+  echo
+  if [ "${#perms[@]}" -gt 0 ]; then
+    echo "In what order should the relay try its models? It stops at the first"
+    echo "that answers; the rest matter only when an earlier one fails."
+  else
+    echo "Which model should lead? The others follow it, in the order the"
+    echo "configuration defines them."
+  fi
+  echo
+  current_line="$(one_line "$current")"
+  index=1
+  while [ "$index" -le "$choices" ]; do
+    line="$(one_line "$(option_order "$index")")"
+    label=""
+    [ "$line" = "$current_line" ] && label="   (current)"
+    printf '  %d)  ' "$index"
+    first=1
+    while IFS= read -r id; do
+      [ "$first" = 1 ] || printf ', then '
+      printf '%s' "$(short "$id")"
+      first=0
+    done <<EOF
+$(option_order "$index")
+EOF
+    printf '%s\n' "$label"
+    index=$((index + 1))
+  done
+  echo "  q)  leave it as it is"
+  echo
+  while :; do
+    printf 'Choose 1-%d, or q: ' "$choices"
+    read -r choice || choice=q
+    case "$choice" in
+      q|Q|"") echo "unchanged."; exit 0 ;;
+      *[!0-9]*|"") ;;
+      *) if [ "$choice" -ge 1 ] && [ "$choice" -le "$choices" ]; then
+           break
+         fi ;;
+    esac
+    echo "  not one of the options."
+  done
+  # Feed the chosen order into the same path an argument list takes.
+  set -- $(option_order "$choice")
+  echo
+fi
+
+if [ "$1" = "--list" ]; then
+  echo "configured in $CONFIG:"
+  echo
+  while IFS= read -r id; do
+    position=""
+    n=0
+    while IFS= read -r ordered; do
+      n=$((n + 1))
+      [ "$ordered" = "$id" ] && position="$n"
+    done <<EOF
+$current
+EOF
+    if [ -n "$position" ]; then
+      printf '  %d.  %s\n' "$position" "$id"
+    else
+      printf '      %s%s\n' "$id" "   (parked, not in the order)"
+    fi
+  done <<EOF
+$defined
+EOF
+  echo
+  echo "The first is what /v1/models advertises and what every request is"
+  echo "rewritten to. Change it by running scripts/set-model-order with no"
+  echo "arguments and picking from the menu, or by naming the order directly."
+  exit 0
+fi
+
+# -- resolve the arguments -------------------------------------------------
+resolve() {
+  local wanted="$1" hit="" count=0 id
+  while IFS= read -r id; do
+    case "$id" in
+      "$wanted") printf '%s\n' "$id"; return 0 ;;
+      *"$wanted"*) hit="$id"; count=$((count + 1)) ;;
+    esac
+  done <<EOF
+$defined
+EOF
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' "$hit"
+    return 0
+  fi
+  if [ "$count" -eq 0 ]; then
+    fail "no configured model matches '$wanted'. Defined:
+$(printf '  %s\n' $defined)"
+  fi
+  fail "'$wanted' matches $count configured models; be more specific. Defined:
+$(printf '  %s\n' $defined)"
+}
+
+order=""
+count=0
+for argument in "$@"; do
+  id="$(resolve "$argument")"
+  case "
+$order" in
+    *"
+$id"*) fail "'$id' named twice; each model may appear once" ;;
+  esac
+  order="$order
+$id"
+  count=$((count + 1))
+done
+order="${order#?}"
+
+[ "$count" -le "$MAX_ORDERED" ] ||
+  fail "$count models named; at most $MAX_ORDERED may be tried, because every
+attempt but the last costs a full RELAY_PRIMARY_TIMEOUT before the turn fails"
+
+first="$(printf '%s\n' "$order" | head -1)"
+
+# -- rewrite the order, and nothing else -----------------------------------
+tmp="$(mktemp)"
+printf '%s\n' "$order" > "$tmp.order"
+awk -v listfile="$tmp.order" '
+  /^order[[:space:]]*=[[:space:]]*\[/ {
+    print "order = ["
+    while ((getline id < listfile) > 0) printf "  \"%s\",\n", id
+    close(listfile)
+    print "]"
+    inside = 1
+    next
+  }
+  inside && /^\]/ {inside = 0; next}
+  inside          {next}
+                  {print}
+' "$CONFIG" > "$tmp"
+mv "$tmp" "$CONFIG"
+rm -f "$tmp.order"
+# mktemp creates 0600 and mv keeps it, which would leave a file the relay
+# cannot read: it runs as its own uid and compose bind-mounts this with the
+# host's mode, exactly as .env.example describes for the credential. Caught by
+# running this script for real, where the relay came back unhealthy with
+# "cannot read the model configuration".
+chmod 644 "$CONFIG"
+
+say "order" "$(printf '%s' "$order" | tr '\n' ' ')"
+say "" "written to $CONFIG"
+
+# -- keep the agent's profile in step --------------------------------------
+if [ -f "$PROFILE" ]; then
+  ptmp="$(mktemp)"
+  awk -v first="$first" '
+    /^model:/                        {inside = 1; print; next}
+    inside && /^[^[:space:]]/        {inside = 0}
+    inside && /^[[:space:]]+default:/ {print "  default: " first; next}
+                                     {print}
+  ' "$PROFILE" > "$ptmp"
+  mv "$ptmp" "$PROFILE"
+  chmod 644 "$PROFILE"
+  say "profile" "model.default = $first"
+fi
+
+# -- make it take effect ---------------------------------------------------
+running() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || echo false)" = true ]
+}
+
+if ! docker info >/dev/null 2>&1 || ! running openrouter-relay; then
+  say "relay" "not running; scripts/1.start-stack will pick this up"
+  exit 0
+fi
+
+say "relay" "recreating so the new order takes effect"
+docker compose up -d --force-recreate openrouter-relay >/dev/null 2>&1 ||
+  fail "could not recreate openrouter-relay"
+
+deadline=$(( SECONDS + 90 ))
+while :; do
+  status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+    openrouter-relay 2>/dev/null || echo absent)"
+  [ "$status" = healthy ] && break
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    docker compose logs --tail 20 openrouter-relay >&2 || true
+    fail "openrouter-relay is $status, not healthy"
+  fi
+  sleep 2
+done
+
+echo
+docker compose logs openrouter-relay 2>/dev/null | grep -m1 '^openrouter-relay.*models:' ||
+  say "" "healthy"
+
+cat <<EOF
+
+The agent's runtime profile has its own copy of model.default on its volume,
+and it is the one a session actually uses. Update it and restart the agent, or
+the next session asks for the previous model:
+
+  public-documentation/OPERATIONS.md section 12, step 5
+
+EOF

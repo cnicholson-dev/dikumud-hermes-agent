@@ -1,0 +1,4 @@
+# Test-only dependencies for the openrouter-relay service.
+-c requirements.txt
+pytest>=8.4.2
+pytest-asyncio>=1.2.0

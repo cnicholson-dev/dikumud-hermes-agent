@@ -1,0 +1,107 @@
+diff -ruN ref/comm.c work/comm.c
+--- ref/comm.c	2026-08-20 10:20:59.954628782 -0400
++++ work/comm.c	2026-08-20 10:21:05.677046170 -0400
+@@ -24,6 +24,8 @@
+ #include <signal.h>
+ #include <time.h>
+ 
++#include "sigcompat.h"
++
+ 
+ #include "structs.h"
+ #include "utils.h"
+diff -ruN ref/modify.c work/modify.c
+--- ref/modify.c	2026-08-20 10:20:59.960361071 -0400
++++ work/modify.c	2026-08-20 10:21:10.726969561 -0400
+@@ -10,6 +10,8 @@
+ #include <string.h>
+ #include <time.h>
+ 
++#include "sigcompat.h"
++
+ #include "structs.h"
+ #include "utils.h"
+ #include "interpreter.h"
+diff -ruN ref/sigcompat.h work/sigcompat.h
+--- ref/sigcompat.h	1969-12-31 19:00:00.000000000 -0500
++++ work/sigcompat.h	2026-08-20 10:20:59.979381153 -0400
+@@ -0,0 +1,79 @@
++/*
++*  sigcompat.h - POSIX replacements for the 4.2BSD signal-mask API.
++*
++*  Part of the DikuMUD compatibility patch series for this project. Not
++*  upstream code. See services/dikumud/patches/README.md.
++*
++*  glibc still supplies sigmask() and sigsetmask(), but marks them deprecated
++*  through __glibc_macro_warning(), which GCC emits with no controlling -W
++*  option. Under the upstream makefile's -Werror that diagnostic is fatal and
++*  cannot be turned off selectively: -Wno-error=cpp, -Wno-error=pragmas and
++*  -Wno-cpp were all tested and none suppress it. Only a blanket -Wno-error
++*  would, which would discard the makefile's warning discipline for every
++*  other file.
++*
++*  glibc also declares sigsetmask() as a real function, so undefining the
++*  macro is not enough to reuse the name. The replacement is therefore given a
++*  distinct name and the call sites are redirected with a macro.
++*
++*  Semantics match the BSD originals, expressed via POSIX sigprocmask(2).
++*/
++
++#ifndef DIKU_SIGCOMPAT_H
++#define DIKU_SIGCOMPAT_H
++
++#include <signal.h>
++
++#undef sigmask
++#undef sigsetmask
++
++#ifndef NSIG
++#define NSIG 32
++#endif
++
++/* BSD signal masks are 32-bit words with signal N held in bit N-1. */
++#define sigmask(sig) (1UL << ((sig) - 1))
++
++#define DIKU_SIGCOMPAT_MAXSIG ((NSIG < 32) ? NSIG : 32)
++
++static inline int diku_mask_to_sigset(unsigned long mask, sigset_t *set)
++{
++	int sig;
++
++	if (sigemptyset(set) < 0)
++		return -1;
++	for (sig = 1; sig <= DIKU_SIGCOMPAT_MAXSIG; sig++)
++		if ((mask & sigmask(sig)) && sigaddset(set, sig) < 0)
++			return -1;
++	return 0;
++}
++
++static inline unsigned long diku_sigset_to_mask(const sigset_t *set)
++{
++	unsigned long mask = 0;
++	int sig;
++
++	for (sig = 1; sig <= DIKU_SIGCOMPAT_MAXSIG; sig++)
++		if (sigismember(set, sig) > 0)
++			mask |= sigmask(sig);
++	return mask;
++}
++
++/*
++*  BSD sigsetmask(): replace the blocked-signal mask outright and return the
++*  mask that was in effect beforehand.
++*/
++static inline int diku_sigsetmask(unsigned long mask)
++{
++	sigset_t set, old;
++
++	if (diku_mask_to_sigset(mask, &set) < 0)
++		return -1;
++	if (sigprocmask(SIG_SETMASK, &set, &old) < 0)
++		return -1;
++	return (int) diku_sigset_to_mask(&old);
++}
++
++#define sigsetmask(mask) diku_sigsetmask(mask)
++
++#endif /* DIKU_SIGCOMPAT_H */

@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# Play one supervised session, and watch it.
+#
+# The agent container idles: it runs `sleep infinity` and acts only when a
+# `hermes chat` process is started inside it. That is the design's supervised
+# non-goal about unattended operation, and it is why a healthy stack shows
+# nothing happening.
+#
+# The session is started detached, inside the container, with its output
+# captured to a file there. Two reasons:
+#
+#   - A run should end because something decided to end it, not because a pipe
+#     broke. Detached, the play is ended by its turn budget, by one of the
+#     boundary or relay budgets, or by this script, and by nothing else.
+#   - The client's own stdout is not the demonstration. The spectator is: it
+#     reads the audit record, the learning store and the relay's metrics, which
+#     is the list design section 10 asks for, and it carries no reasoning and no
+#     credential. The raw client output is kept anyway, because a session that
+#     fails to start says why there and nowhere else.
+#
+# Ctrl-C in the spectator ends the run. Watching and playing start from one
+# command, so ending one ends the other: a view that closes while the agent
+# plays on invisibly is how a session that looked finished turns out to have
+# been running for another twenty minutes. `--no-watch` is the way to start a
+# run and leave it playing, and `scripts/spectate` attaches without ever
+# ending anything.
+#
+# One session at a time, by construction: mud-control holds a single game
+# session, so a second client would resume the same one and both would be
+# issuing commands into a protocol that allows one command per turn.
+#
+# The character is not chosen here. This resumes whichever one the stack is
+# already configured for, which is what `scripts/4.load-character` sets and
+# `scripts/5.new-character` creates. The name is printed before anything
+# starts, because a session that quietly resumes the wrong character is a
+# session whose learning goes to the wrong place.
+#
+# A watched run leaves a capture behind in `sessions/`: the game's own output,
+# the transcript, the final frame, the client's log, and an asciicast converted
+# to a GIF. See `scripts/capture-session`, which is also what
+# `scripts/3.stop-stack` calls for a run started with `--no-watch`.
+#
+#   scripts/2.start-agent [--turns N] [-q PROMPT] [--no-watch] [--no-capture]
+#
+# Exit codes: 0 the session played and was ended or is playing under
+# --no-watch, 1 the stack is not ready or the session did not start, 2 usage.
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+SERVICES=(dikumud mud-control openrouter-relay hermes-player)
+LOG=/tmp/hermes-chat.log
+PLAY=/var/log/mud-control/play.log
+TURNS=100
+WATCH=1
+CAPTURE=1
+DIR=""
+OFFSET=0
+PROMPT="Read your notes with learn_recall, then connect and continue exploring where your notes stop. Store anything worth remembering as you learn it."
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/2.start-agent [--turns N] [-q PROMPT] [--no-watch] [--no-capture]
+
+  --turns N     turn budget for the session (default 100). One turn is one
+                model call, so the connect, each observe, each learning write
+                and every refused command spend one too. The session also ends
+                on wall-clock, repetition, refusal and relay budgets, and every
+                ending is recorded with a reason.
+  -q PROMPT     what to ask the agent to do (default: read its notes, then
+                continue exploring where they stop)
+  --no-watch    start the session and return, leaving it playing, instead of
+                opening the spectator
+  --no-capture  do not write a capture into sessions/ when the run ends
+
+Ctrl-C in the spectator ends the run as well as the view. Under --no-watch the
+run is left playing, and scripts/spectate attaches to it without ending
+anything. scripts/3.stop-stack ends a run and takes the stack down, and
+captures it if this script did not.
+
+The character is whichever one the stack is configured for. Change it with
+scripts/4.load-character, or make a new one with scripts/5.new-character.
+EOF
+  exit 2
+}
+
+fail() { echo "2.start-agent: $*" >&2; exit 1; }
+say()  { printf '%-16s %s\n' "$1" "$2"; }
+
+# running, running_character, current_session_id. Sourced after say/fail.
+# shellcheck source=scripts/lib/session.sh
+. scripts/lib/session.sh
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --turns)
+      shift
+      [ $# -gt 0 ] || usage
+      TURNS="$1"
+      ;;
+    -q|--prompt)
+      shift
+      [ $# -gt 0 ] || usage
+      PROMPT="$1"
+      ;;
+    --no-watch)   WATCH=0 ;;
+    --no-capture) CAPTURE=0 ;;
+    -h|--help)  usage ;;
+    *) echo "2.start-agent: unknown option: $1" >&2; usage ;;
+  esac
+  shift
+done
+
+case "$TURNS" in
+  ''|*[!0-9]*) fail "--turns takes a whole number" ;;
+esac
+[ "$TURNS" -gt 0 ] || fail "--turns takes a number above zero"
+[ -n "$PROMPT" ] || fail "-q takes a non-empty prompt"
+
+# -- the stack has to be up first -----------------------------------------
+docker info >/dev/null 2>&1 || fail "the Docker daemon is not responding"
+
+for service in "${SERVICES[@]}"; do
+  status="$(docker inspect \
+    -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+    "$service" 2>/dev/null || echo absent)"
+  [ "$status" = healthy ] ||
+    fail "$service is $status, not healthy. Start the stack with scripts/1.start-stack."
+done
+say "stack" "all four services healthy"
+
+if docker exec hermes-player pgrep -f "hermes chat" >/dev/null 2>&1; then
+  fail "a session is already playing. Watch it with scripts/spectate, or end it
+with scripts/3.stop-stack."
+fi
+
+# -- who is playing -------------------------------------------------------
+#
+# Read from the container rather than from .env, because the container's value
+# is the one that is actually playing: MUD_CONTROL_CHARACTER is read once at
+# startup and binds the learning store for the life of the process. A .env
+# edited without a recreate leaves the two disagreeing, and the next session
+# would write one character's notes under another's name.
+CHARACTER="$(running_character)"
+[ -n "$CHARACTER" ] || fail "could not read the character from mud-control"
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . ./.env
+  set +a
+fi
+if [ -n "${MUD_CHARACTER:-}" ] && [ "$MUD_CHARACTER" != "$CHARACTER" ]; then
+  fail "the running boundary and .env name different characters:
+  mud-control   $CHARACTER
+  .env          $MUD_CHARACTER
+Switch properly with scripts/4.load-character $MUD_CHARACTER, which sets the
+credential file and the environment together and recreates the container."
+fi
+say "character" "resuming $CHARACTER"
+
+# Where this session's game text starts in the rolling play log. Recorded
+# before the first command so the capture can slice exactly this session out of
+# a file that has no session markers in it.
+if [ "$CAPTURE" = 1 ]; then
+  OFFSET="$(docker compose exec -T mud-control sh -c "wc -c < $PLAY 2>/dev/null" |
+            tr -dc '0-9')"
+  : "${OFFSET:=0}"
+  DIR="sessions/$(date -u +%Y-%m-%dT%H%M%SZ)-$CHARACTER"
+  # Created now rather than by the capture at the end, because the recorder
+  # writes session.cast into it while the session is still playing.
+  mkdir -p "$DIR"
+fi
+
+# -- start it -------------------------------------------------------------
+#
+# The prompt goes in as an environment variable rather than inside the quoted
+# command string, so a prompt containing quotes cannot break the command or be
+# reinterpreted by the container's shell.
+if [ "$TURNS" -eq 1 ]; then TURN_WORD="turn"; else TURN_WORD="turns"; fi
+say "session" "starting, $TURNS $TURN_WORD"
+docker compose exec -d -e AGENT_PROMPT="$PROMPT" hermes-player \
+  sh -c "hermes chat --max-turns $TURNS -q \"\$AGENT_PROMPT\" > $LOG 2>&1" ||
+  fail "could not start the session"
+
+# A session that cannot reach the model dies within seconds and records nothing
+# in the audit record, so the spectator would sit empty with no explanation.
+# Check the client is still there before handing over to it.
+sleep 6
+if ! docker exec hermes-player pgrep -f "hermes chat" >/dev/null 2>&1; then
+  echo >&2
+  echo "2.start-agent: the session stopped within 6s. Its output:" >&2
+  echo >&2
+  docker exec hermes-player tail -n 20 "$LOG" >&2 2>/dev/null ||
+    echo "  (no output was captured in $LOG)" >&2
+  exit 1
+fi
+say "" "playing; client output is in $LOG inside hermes-player"
+
+# Printed when a run is deliberately left playing, which is --no-watch only.
+playing_note() {
+  cat <<EOF
+
+The session is playing detached and this script is done. It ends on its own
+turn budget and records why.
+
+  scripts/spectate                                   watch it
+  docker exec hermes-player pkill -f "hermes chat"   end the run
+  scripts/3.stop-stack                               end it and stop the stack
+
+The client's own output is in $LOG inside hermes-player.
+
+EOF
+}
+
+ended_note() {
+  cat <<EOF
+
+The stack is still up and the character is still logged in, so the next run
+resumes where this one stopped.
+
+  scripts/2.start-agent    play again
+  scripts/3.stop-stack     stop the stack and close the game session
+
+The client's own output is in $LOG inside hermes-player.
+
+EOF
+}
+
+# -- the capture ----------------------------------------------------------
+#
+# Written once, after the session has actually ended, so the transcript has its
+# stop reason and the play log has its last line. Guarded because Ctrl-C can
+# arrive while this is already running.
+CAPTURED=0
+capture() {
+  [ "$CAPTURE" = 1 ] || return 0
+  [ "$CAPTURED" = 0 ] || return 0
+  CAPTURED=1
+  echo
+  scripts/capture-session --dir "$DIR" --offset "$OFFSET" || return 0
+
+  # The GIF is a convenience made from the cast, which is the artefact that
+  # matters: it is text, it replays at any speed, and it can be searched.
+  if [ -f "$DIR/session.cast" ] && command -v agg >/dev/null 2>&1; then
+    # The flags public-documentation/DEMO.md gives for a published recording, so
+    # every capture looks the same.
+    agg --theme asciinema --font-size 14 --speed 1.5 \
+      "$DIR/session.cast" "$DIR/session.gif" >/dev/null 2>&1 &&
+      say "" "gif written" ||
+      say "" "agg failed; the cast is still there"
+  elif [ -f "$DIR/session.cast" ]; then
+    say "" "agg is not installed; no gif, the cast is still there"
+  fi
+}
+
+# Ending the view ends the run. Same escalation as 3.stop-stack: ask the client
+# to stop, wait, and only then insist.
+stop_session() {
+  # One exit path rather than three, because the capture and the closing note
+  # belong at the end of all of them and a fourth `return` would eventually
+  # skip one.
+  if ! docker exec hermes-player pgrep -f "hermes chat" >/dev/null 2>&1; then
+    say "session" "already ended on its own"
+  else
+    say "session" "ending the run"
+    docker exec hermes-player pkill -f "hermes chat" >/dev/null 2>&1 || true
+    local _attempt ended=0
+    for _attempt in $(seq 1 20); do
+      if ! docker exec hermes-player pgrep -f "hermes chat" >/dev/null 2>&1; then
+        say "" "ended"
+        ended=1
+        break
+      fi
+      sleep 0.5
+    done
+    if [ "$ended" = 0 ]; then
+      docker exec hermes-player pkill -9 -f "hermes chat" >/dev/null 2>&1 || true
+      say "" "ended, after SIGKILL"
+    fi
+  fi
+  capture
+  ended_note
+}
+
+if [ "$WATCH" = 0 ]; then
+  playing_note
+  exit 0
+fi
+
+echo
+# The spectator has the terminal until it is interrupted. It restores the
+# screen itself, so anything printed after this lands on the normal one.
+trap 'echo; stop_session; exit 0' INT
+
+# The spectator needs 143 columns to show the game feed beside its panels:
+# 100 for the panels, 3 for the gap, 40 before a feed is too narrow to read a
+# room description in. Below that it renders the panels alone, by design.
+COLUMNS_FOR_FEED=143
+if [ -t 1 ]; then
+  columns="$(tput cols 2>/dev/null || echo "$COLUMNS_FOR_FEED")"
+  if [ "$columns" -lt "$COLUMNS_FOR_FEED" ]; then
+    say "view" "terminal is $columns columns; the game feed needs $COLUMNS_FOR_FEED, so it is hidden"
+  fi
+fi
+
+# Recorded when a recorder is available. --until-stopped is what makes the
+# recording end by itself: a spectator killed by a signal leaves the GIF frozen
+# on whatever was on screen, while a bounded loop gets a clean end.
+#
+# The size is NOT forced, deliberately. Forcing a width below the 143 columns
+# the game feed needs builds a pty narrower than the feed, so the column is
+# suppressed in every watched session however wide the real terminal is.
+# Inheriting the terminal means what you watch and what the recording shows are
+# the same thing.
+if [ "$CAPTURE" = 1 ] && command -v asciinema >/dev/null 2>&1; then
+  asciinema rec "$DIR/session.cast" --overwrite \
+    --idle-time-limit 2 -c "scripts/spectate --until-stopped" || true
+else
+  if [ "$CAPTURE" = 1 ]; then
+    say "recording" "asciinema is not installed; watching without recording"
+  fi
+  scripts/spectate --until-stopped || true
+fi
+
+# Reached when the spectator exits on its own rather than by Ctrl-C. Closing
+# the view means the same thing either way.
+stop_session

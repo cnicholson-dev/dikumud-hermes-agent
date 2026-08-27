@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Cody Nicholson
+# SPDX-License-Identifier: LGPL-2.1-only
+#
+# Play as a particular character.
+#
+# WHY THIS IS A SCRIPT
+#   Two different values decide who plays, and nothing in the service
+#   reconciles them. The login name is the first line of the credential file,
+#   read at connect time by mud-control's transport. The learning store is
+#   keyed by MUD_CONTROL_CHARACTER, read once at startup:
+#
+#       store = LearningStore(
+#           LearningStore.root_for(..., config.character), audit)
+#
+#   Change one without the other and the stack logs in as Bram and writes
+#   Wren's notes, silently, and the mistake only shows up later as a character
+#   that "remembers" rooms it never walked into. Doing it by hand is how that
+#   happens, so this writes both from one input or refuses.
+#
+#   MUD_CONTROL_CHARACTER is read in build_from_env, so a change needs the
+#   container RECREATED rather than restarted. That is also done here.
+#
+# THE SHELF
+#   One file per character, outside the repository, beside the two secrets:
+#
+#       ${SECRETS_DIR}/characters/Wren      two lines: name, password
+#       ${SECRETS_DIR}/characters/Bram
+#
+#   Selecting a character copies its file over ${SECRETS_DIR}/game-credential,
+#   which is the only one any container sees. The shelf is a host-side
+#   convenience and is mounted nowhere.
+#
+#   Adopt an existing hand-made credential by copying it in once:
+#       cp ${SECRETS_DIR}/game-credential ${SECRETS_DIR}/characters/Wren
+#
+#   scripts/4.load-character [Name]
+#
+# Exit codes: 0 loaded, 1 a check failed, 2 usage.
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+# Pencil a name in here to make `scripts/4.load-character` with no argument
+# load it. An argument always wins.
+CHARACTER=""
+
+LEARNING=/var/lib/mud-control/learning
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/4.load-character [Name]
+
+Loads the character named on the command line, or the one penciled into the
+CHARACTER= line at the top of this script. The character must already have a
+file on the shelf at ${SECRETS_DIR}/characters/<Name>; scripts/5.new-character
+is what puts one there.
+
+Ends any session that is open, sets the credential file and MUD_CHARACTER
+together, and recreates mud-control so the new name takes effect.
+EOF
+  exit 2
+}
+
+fail() { echo "4.load-character: $*" >&2; exit 1; }
+say()  { printf '%-16s %s\n' "$1" "$2"; }
+
+# running, stop_client, end_session, running_character.
+# shellcheck source=scripts/lib/session.sh
+. scripts/lib/session.sh
+
+case "${1:-}" in
+  -h|--help) usage ;;
+esac
+
+NAME="${1:-$CHARACTER}"
+[ -n "$NAME" ] || usage
+
+# DikuMUD's own rule, from interpreter.c by way of scripts/bootstrap-character.
+# Checked here so a name the game will refuse never reaches the credential file.
+case "$NAME" in
+  *[!A-Za-z]*) fail "character name must be 2-15 alphabetic characters" ;;
+esac
+if [ "${#NAME}" -lt 2 ] || [ "${#NAME}" -gt 15 ]; then
+  fail "character name must be 2-15 alphabetic characters"
+fi
+
+[ -f .env ] || fail ".env is missing. Copy .env.example and set SECRETS_DIR."
+set -a
+# shellcheck source=/dev/null
+. ./.env
+set +a
+[ -n "${SECRETS_DIR:-}" ] || fail "SECRETS_DIR is not set in .env"
+
+SHELF="$SECRETS_DIR/characters/$NAME"
+LIVE="$SECRETS_DIR/game-credential"
+
+[ -r "$SHELF" ] || fail "no shelf file for $NAME at $SHELF
+Create the character with scripts/5.new-character $NAME, or adopt an existing
+credential with:
+  cp $LIVE $SECRETS_DIR/characters/$NAME"
+
+# Read for checking only. The password is never printed, never passed as an
+# argument, and never held in a variable that is echoed.
+shelf_name="$(awk 'NR==1' "$SHELF")"
+shelf_pw_len="$(awk 'NR==2{print length($0)}' "$SHELF")"
+: "${shelf_pw_len:=0}"
+
+[ "$shelf_name" = "$NAME" ] ||
+  fail "$SHELF names '$shelf_name' on its first line, not '$NAME'.
+That disagreement is the whole reason this script exists; fix the file."
+[ "$shelf_pw_len" -gt 0 ] || fail "$SHELF has no password on its second line"
+# transport.py reports this at runtime and the login loop retries until it runs
+# out of attempts. Catching it here turns a puzzling authentication fault into
+# a message before anything is touched.
+[ "$shelf_pw_len" -le 10 ] ||
+  fail "the password in $SHELF is $shelf_pw_len characters; DikuMUD rejects
+anything longer than 10"
+
+docker info >/dev/null 2>&1 || fail "the Docker daemon is not responding"
+
+# -- end whatever is playing ----------------------------------------------
+#
+# Before the credential file changes, so the session that ends is recorded
+# against the character that played it.
+if running mud-control; then
+  previous="$(running_character)"
+  if [ -n "$previous" ] && [ "$previous" = "$NAME" ]; then
+    say "character" "$NAME is already loaded"
+  fi
+  stop_client
+  end_session
+  scripts/capture-session --if-new || true
+fi
+
+# -- write both values together -------------------------------------------
+if [ -f "$LIVE" ]; then
+  backup="$LIVE.$(date -u +%Y%m%d%H%M%S).bak"
+  cp -p "$LIVE" "$backup"
+  say "credential" "previous kept as $(basename "$backup")"
+fi
+cp "$SHELF" "$LIVE"
+# 0644 inside a 0700 directory, for the reason .env.example gives in full:
+# outside swarm, compose bind-mounts a secret with the host file's mode and
+# does not remap it, so a 0600 file is unreadable to a service running as its
+# own uid. The directory is the access control.
+chmod 644 "$LIVE"
+say "credential" "$LIVE now holds $NAME"
+
+tmp="$(mktemp)"
+awk -v n="$NAME" '
+  /^MUD_CHARACTER=/ { print "MUD_CHARACTER=" n; seen = 1; next }
+                    { print }
+  END               { if (!seen) print "MUD_CHARACTER=" n }
+' .env > "$tmp"
+mv "$tmp" .env
+say ".env" "MUD_CHARACTER=$NAME"
+
+# -- make it take effect ---------------------------------------------------
+if ! running mud-control; then
+  say "stack" "not running; scripts/1.start-stack will pick this up"
+  exit 0
+fi
+
+say "mud-control" "recreating so the new character takes effect"
+docker compose up -d --force-recreate mud-control >/dev/null 2>&1 ||
+  fail "could not recreate mud-control"
+
+deadline=$(( SECONDS + 90 ))
+while :; do
+  status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+    mud-control 2>/dev/null || echo absent)"
+  [ "$status" = healthy ] && break
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    docker compose logs --tail 20 mud-control >&2 || true
+    fail "mud-control is $status, not healthy"
+  fi
+  sleep 2
+done
+say "" "healthy"
+
+loaded="$(running_character)"
+[ "$loaded" = "$NAME" ] ||
+  fail "mud-control came up as '$loaded' rather than '$NAME'"
+
+if docker compose exec -T mud-control sh -c "test -d $LEARNING/$NAME" 2>/dev/null; then
+  say "learning" "$NAME has notes from previous sessions"
+else
+  say "learning" "$NAME has no notes yet"
+fi
+
+cat <<EOF
+
+$NAME is loaded. Nothing plays until you start a session:
+
+  scripts/2.start-agent
+
+EOF

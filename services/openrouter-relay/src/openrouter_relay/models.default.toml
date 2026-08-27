@@ -1,0 +1,76 @@
+# The packaged default model set. NOT the file a deployment edits.
+#
+# This copy ships inside the image and is used only when RELAY_MODEL_CONFIG is
+# unset, which is the case for the unit tests and for a bare `docker run` of
+# this image alone. compose always sets that variable, and when it is set the
+# file it names must load or the relay refuses to start: a deployment never
+# falls back to this file without saying so.
+#
+# The deployment's copy is config/relay/models.toml at the repository root, and
+# its header carries the operator instructions and the capability checklist.
+# The model tables here are the same three models, in the same order, so the
+# shipped default is the set recorded in
+# public-documentation/DEPENDENCY_RECORD.md section 4.
+#
+# It exists as a file rather than as constants in policy.py so that no model
+# identifier appears in the relay's source at all.
+version = 2
+
+order = [
+  "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "nvidia/nemotron-3.5-lightning:free",
+]
+
+# Provider tags come from `endpoints[].tag`, never from `provider_name`. The
+# display name "Nvidia" is accepted by the API and then matches nothing, and
+# the request comes back 404, which is indistinguishable from a missing model.
+# Tags may be qualified by quantisation, as Lightning's is.
+
+[models."nvidia/nemotron-3-ultra-550b-a55b:free"]
+providers = ["nvidia"]
+name = "NVIDIA: Nemotron 3 Ultra (free)"
+context_length = 1000000
+max_completion_tokens = 65536
+pricing_prompt = "0"
+pricing_completion = "0"
+supported_parameters = ["include_reasoning", "max_tokens", "reasoning",
+                        "reasoning_effort", "seed", "temperature",
+                        "tool_choice", "tools", "top_p"]
+reasoning_default_effort = "high"
+reasoning_supported_efforts = ["high", "medium"]
+
+[models."nvidia/nemotron-3-super-120b-a12b:free"]
+providers = ["nvidia"]
+name = "NVIDIA: Nemotron 3 Super (free)"
+context_length = 262144
+max_completion_tokens = 262144
+pricing_prompt = "0"
+pricing_completion = "0"
+# Advertises response_format and structured_outputs as well; they are absent
+# here because the relay's own ceiling does not include them, and listing a
+# parameter the relay will never forward would only make this file look like
+# it decides more than it does.
+supported_parameters = ["include_reasoning", "max_tokens", "reasoning",
+                        "reasoning_effort", "seed", "temperature",
+                        "tool_choice", "tools", "top_p"]
+# Lower than Ultra's, which is why the catalog cannot be a constant: the client
+# clamps its requested effort to whatever the first ordered model advertises.
+reasoning_default_effort = "medium"
+reasoning_supported_efforts = ["medium", "low"]
+
+[models."nvidia/nemotron-3.5-lightning:free"]
+providers = ["nvidia/nvfp4"]
+name = "NVIDIA: Nemotron 3.5 Lightning (free)"
+context_length = 1000000
+max_completion_tokens = 65536
+pricing_prompt = "0"
+pricing_completion = "0"
+# No reasoning_effort, which is why the effective allowlist is eight rather
+# than nine whenever this model is in the order: the same validated body goes
+# to whichever model answers, and a 4xx does not fall back.
+supported_parameters = ["include_reasoning", "max_tokens", "reasoning",
+                        "seed", "temperature", "tool_choice", "tools", "top_p"]
+# Its reasoning metadata is {"mandatory": false} and nothing else: no efforts,
+# no default. Absent here rather than invented, so /v1/models carries no
+# reasoning block while this model leads.
